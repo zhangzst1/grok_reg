@@ -1,5 +1,7 @@
 # Hotmail API 超时与邮箱重试配置修复设计
 
+> 后续语义变更：`mail_retry_count=0` 现在除禁止更换邮箱外，也会关闭 Hotmail API 内部的 HTTP 临时错误重试；`1` 仍保留 API 默认重试。下文保留最初设计背景。
+
 ## 目标
 
 修复 Hotmail 外部 API 模式把超过服务端上限的 `mail_timeout` 原样传给 `timeout_seconds` 而导致 HTTP 400 的问题，并让 CLI 与 GUI 一致遵守 `mail_retry_count`，使配置为 `0` 时不再换邮箱重新注册。

@@ -85,7 +85,7 @@
   "mail_timeout": 150,
   "// mail_poll_interval": "收件轮询间隔（秒）",
   "mail_poll_interval": 0.3,
-  "// mail_retry_count": "邮箱阶段最大尝试次数；0 或 1 表示只尝试当前邮箱、不换邮箱，2 表示最多尝试两个邮箱。",
+  "// mail_retry_count": "邮箱阶段最大尝试次数；0 表示不更换邮箱且关闭 Hotmail API HTTP 临时错误重试，1 表示只尝试当前邮箱但保留 API 内部重试，2 表示最多尝试两个邮箱。",
   "mail_retry_count": 3,
   "// code_form_timeout": "验证码表单超时（秒）",
   "code_form_timeout": 180,

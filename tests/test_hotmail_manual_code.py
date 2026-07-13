@@ -8,6 +8,8 @@ import runpy
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 import grok_register_ttk as reg
 import register_cli as cli
 
@@ -38,6 +40,7 @@ class HotmailApiConfigurationTests(unittest.TestCase):
 class ManualVerificationCodeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_config = dict(reg.config)
+        reg.config["mail_retry_count"] = 3
 
     def tearDown(self) -> None:
         reg.config.clear()
@@ -96,6 +99,35 @@ class ManualVerificationCodeTests(unittest.TestCase):
             timeout_seconds=75,
         )
         log_callback.assert_called_once_with("[*] Hotmail/Outlook 外部 API 已获取验证码")
+
+    def assert_api_http_attempts(self, mail_retry_count: int, expected_attempts: int) -> None:
+        from utils.verification_code import VerificationCodeFetcher
+
+        reg.config.update(
+            {
+                "email_provider": "hotmail",
+                "hotmail_code_mode": "api",
+                "mail_retry_count": mail_retry_count,
+            }
+        )
+        with (
+            mock.patch.object(
+                VerificationCodeFetcher,
+                "_do_get",
+                side_effect=requests.exceptions.ConnectionError("temporary failure"),
+            ) as request_get,
+            mock.patch("utils.verification_code.time.sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Hotmail API 获取验证码失败"):
+                reg.get_oai_code("dev-token", "user@hotmail.com")
+
+        self.assertEqual(request_get.call_count, expected_attempts)
+
+    def test_api_mode_disables_http_retries_when_mail_retry_count_is_zero(self) -> None:
+        self.assert_api_http_attempts(mail_retry_count=0, expected_attempts=1)
+
+    def test_api_mode_keeps_default_http_retries_when_mail_retry_count_is_one(self) -> None:
+        self.assert_api_http_attempts(mail_retry_count=1, expected_attempts=3)
 
     def test_api_mode_caps_timeout_at_service_maximum(self) -> None:
         reg.config.update({"email_provider": "hotmail", "hotmail_code_mode": "api"})

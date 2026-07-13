@@ -20,7 +20,22 @@ class VerificationCodeFetcher:
     DEFAULT_MAX_RETRIES = 3
     DEFAULT_RETRY_BACKOFF = 2
 
-    _CODE_PATTERN = re.compile(r"(?<![\d-])\d{3}-\d{3}(?![\d-])")
+    _CODE_PATTERN = re.compile(
+        r"(?<![A-Z0-9_-])[A-Z0-9]{3}-[A-Z0-9]{3}(?![A-Z0-9_-])",
+        re.IGNORECASE | re.ASCII,
+    )
+    _CODE_CONTEXT_PATTERN = re.compile(
+        r"(?:verification\s+code|security\s+code|one[-\s]?time\s+code|"
+        r"xai\s+code|验证码|\bcode\b)\s*(?:(?:is|为|是)\s*)?[:：=-]?\s*$",
+        re.IGNORECASE | re.ASCII,
+    )
+    _CODE_SUFFIX_CONTEXT_PATTERN = re.compile(
+        r"^\s*(?:(?:(?:is|was)\s+(?:your\s+)?)?"
+        r"(?:verification\s+code|security\s+code|one[-\s]?time\s+code|"
+        r"xai\s+code|\bcode\b)|(?:(?:是|为)\s*)?(?:您的|你的)?验证码)",
+        re.IGNORECASE | re.ASCII,
+    )
+    _SUBJECT_PREFIX_PATTERN = re.compile(r"^\s*subject\s*:", re.IGNORECASE | re.ASCII)
 
     def __init__(self, api_key=None, request_timeout=None, session=None,
                  max_retries=None, retry_backoff=None, proxies=None, trust_env=None):
@@ -70,6 +85,17 @@ class VerificationCodeFetcher:
                 # 4xx（429 除外）一般重试无效，直接抛出
                 status = exc.response.status_code if exc.response is not None else None
                 if status is not None and status != 429 and status < 500:
+                    if self.max_retries == 1:
+                        logger.error(
+                            "请求 %s 首次尝试失败，HTTP %s 不可重试，未执行重试：%s",
+                            url,
+                            status,
+                            exc,
+                        )
+                    else:
+                        logger.error(
+                            "请求 %s 失败，HTTP %s 不可重试：%s", url, status, exc
+                        )
                     raise
                 last_exc = exc
             except requests.exceptions.ProxyError as exc:
@@ -90,7 +116,10 @@ class VerificationCodeFetcher:
                 )
                 time.sleep(wait)
 
-        logger.error("请求 %s 在 %s 次尝试后仍失败：%s", url, self.max_retries, last_exc)
+        if self.max_retries == 1:
+            logger.error("请求 %s 首次尝试失败，未执行重试：%s", url, last_exc)
+        else:
+            logger.error("请求 %s 在 %s 次尝试后仍失败：%s", url, self.max_retries, last_exc)
         raise VerificationCodeError(f"请求 {url} 失败：{last_exc}") from last_exc
 
     def wait_for_message(self, email, timeout_seconds=DEFAULT_WAIT_TIMEOUT):
@@ -113,8 +142,37 @@ class VerificationCodeFetcher:
     def extract_code(cls, text):
         if not text:
             return None
-        match = cls._CODE_PATTERN.search(text)
-        return match.group(0).replace("-", "") if match else None
+        candidates = []
+        for match in cls._CODE_PATTERN.finditer(text):
+            code = match.group(0).upper()
+
+            prefix = text[max(0, match.start() - 120):match.start()]
+            plain_prefix = re.sub(r"<[^>]+>", " ", prefix)
+            plain_prefix = re.sub(r"\s+", " ", plain_prefix)
+            suffix = text[match.end():match.end() + 120]
+            plain_suffix = re.sub(r"<[^>]+>", " ", suffix)
+            plain_suffix = re.sub(r"\s+", " ", plain_suffix)
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_prefix = text[line_start:match.start()]
+
+            score = 0
+            if (
+                cls._CODE_CONTEXT_PATTERN.search(plain_prefix)
+                or cls._CODE_SUFFIX_CONTEXT_PATTERN.search(plain_suffix)
+            ):
+                score = 2
+            elif cls._SUBJECT_PREFIX_PATTERN.search(line_prefix):
+                score = 1
+            candidates.append((score, code))
+
+        if not candidates:
+            return None
+        best_score = max(score for score, _code in candidates)
+        if best_score > 0:
+            return next(code for score, code in candidates if score == best_score)
+        if len(candidates) == 1:
+            return candidates[0][1]
+        return None
 
     def fetch_code(self, email, timeout_seconds=DEFAULT_WAIT_TIMEOUT):
         logger.info("等待邮箱 %s 的验证码邮件（超时 %ss）", email, timeout_seconds)

@@ -81,8 +81,8 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 - CLI 多线程会串行显示输入提示；GUI 多线程会逐个显示验证码窗口，提示中包含目标邮箱
 - `hotmail_code_mode=imap`：经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP 自动拉验证码
 - `hotmail_code_mode=api`：调用 `utils/verification_code.py` 中的外部 API 等待邮件并提取验证码；使用该文件内置的 API Key、超时重试和代理故障直连逻辑
-- `mail_retry_count=0` 或 `1`：邮箱阶段只尝试一次，验证码失败后不更换邮箱；`2` 表示最多尝试两个邮箱
-- `mail_retry_count` 不控制 `VerificationCodeFetcher` 内部的 HTTP 临时错误重试；该工具仍按自身配置重试网络错误、429 和 5xx
+- `mail_retry_count=0`：邮箱阶段只尝试一次，并关闭 Hotmail API 内部的 HTTP 失败重试
+- `mail_retry_count=1`：只尝试当前邮箱、不换邮箱，但 Hotmail API 仍按默认策略重试临时 HTTP 错误；`2` 表示最多尝试两个邮箱
 - `mail_timeout` 在 Hotmail API 模式会自动限制到外部接口允许的 `1–120` 秒
 - 仅 IMAP 模式会刷新 Microsoft access token；refresh_token 若轮换会**自动回写** `mail_credentials.txt`
 - 成功 / 失败 / 占用中的 alias 会参与去重与 `hotmail_max_aliases_per_account` 计数

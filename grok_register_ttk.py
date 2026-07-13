@@ -1835,6 +1835,14 @@ def get_mail_attempt_count(default=3):
         return default
 
 
+def mail_failure_retries_disabled():
+    """Return whether mail_retry_count explicitly disables failure retries."""
+    try:
+        return int(config.get("mail_retry_count", 3)) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def should_retry_verification_error(message):
     """Retry mailbox failures, but never repeat a prompt the user cancelled."""
     text = str(message or "")
@@ -1929,7 +1937,8 @@ def get_oai_code(
                 from utils.verification_code import VerificationCodeFetcher
 
                 api_timeout = max(1, min(int(timeout), 120))
-                code = VerificationCodeFetcher().fetch_code(
+                fetcher_options = {"max_retries": 1} if mail_failure_retries_disabled() else {}
+                code = VerificationCodeFetcher(**fetcher_options).fetch_code(
                     email, timeout_seconds=api_timeout
                 )
             except Exception as exc:

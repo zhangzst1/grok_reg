@@ -1,5 +1,7 @@
 # Hotmail API Timeout and Mail Retry Configuration Implementation Plan
 
+> 后续语义变更：`mail_retry_count=0` 现在除禁止更换邮箱外，也会关闭 Hotmail API 内部的 HTTP 临时错误重试；`1` 仍保留 API 默认重试。下文是最初实现计划。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Keep Hotmail API wait time within the service's 1–120 second contract and make CLI/GUI consistently treat `mail_retry_count=0` as one mailbox attempt with no mailbox replacement.
