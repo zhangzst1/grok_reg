@@ -25,6 +25,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import grok_register_ttk as reg  # noqa: E402
+from cli_browser_env import BrowserEnvApiClient, parse_browser_env_ids  # noqa: E402
 
 
 # Linux 适配: DrissionPage 默认找 'chrome', 我们装的是 chromium
@@ -176,6 +177,38 @@ def resolve_mint_workers(
     if config.get("cpa_export_enabled", True):
         return max(1, min(int(threads), 4))
     return 0
+
+
+def resolve_cli_browser_env(
+    config: dict,
+    *,
+    requested_threads: int,
+) -> tuple[BrowserEnvApiClient, list[int], int]:
+    """Build the CLI browser environment client and cap worker concurrency."""
+    env_ids = parse_browser_env_ids(config.get("browser_env_ids"))
+    token = str(
+        os.environ.get("BROWSER_API_TOKEN")
+        or config.get("browser_api_token", "")
+        or ""
+    ).strip()
+    base_url = str(
+        config.get("browser_api_base", "http://127.0.0.1:50326") or ""
+    ).strip()
+    try:
+        start_wait_seconds = float(config.get("browser_start_wait_seconds", 3) or 0)
+        timeout = float(config.get("browser_api_timeout", 30) or 30)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("browser API timeout settings must be numeric") from exc
+
+    client = BrowserEnvApiClient(
+        base_url=base_url,
+        token=token,
+        env_ids=env_ids,
+        start_wait_seconds=start_wait_seconds,
+        timeout=timeout,
+    )
+    threads = min(max(1, int(requested_threads)), len(env_ids))
+    return client, env_ids, threads
 
 
 def resolve_mint_queue_max(config: dict, mint_workers: int, cli_value: int | None = None) -> int:
@@ -427,7 +460,14 @@ def _register_worker(
     mint_queue: queue.Queue | None,
     forever: bool,
     do_mint_inline: bool,
+    *,
+    browser_client: BrowserEnvApiClient | None = None,
+    env_id: int | None = None,
 ):
+    if browser_client is not None:
+        if env_id is None:
+            raise ValueError(f"worker {worker_id} has no browser env_id")
+        browser_client.bind_worker(env_id)
     while True:
         try:
             idx = task_queue.get_nowait()
@@ -536,7 +576,20 @@ def main() -> int:
 
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
-    threads = max(1, min(args.threads, 10))
+    requested_threads = max(1, min(args.threads, 10))
+    try:
+        browser_client, browser_env_ids, threads = resolve_cli_browser_env(
+            cfg0,
+            requested_threads=requested_threads,
+        )
+    except Exception as exc:
+        print(f"[!] CLI 浏览器环境配置无效: {exc}", flush=True)
+        return 1
+    if threads < requested_threads:
+        print(
+            f"[*] 注册线程由 {requested_threads} 限制为 {threads}（env_id 数量={len(browser_env_ids)}）",
+            flush=True,
+        )
     fast = bool(args.fast) and not bool(args.no_fast)
 
     mint_workers = resolve_mint_workers(
@@ -600,8 +653,13 @@ def main() -> int:
 
     log_thread = threading.Thread(target=_log_writer, daemon=True)
     log_thread.start()
+    browser_client.log_callback = lambda message: log(0, message)
 
     try:
+        reg.TabPool.configure_browser_lifecycle(
+            browser_client.start_browser,
+            browser_client.stop_browser,
+        )
         reg.TabPool.init(reg.create_browser_options, log_callback=lambda m: log(0, m))
     except Exception as exc:
         print(f"[!] 浏览器初始化失败: {exc}", flush=True)
@@ -643,6 +701,10 @@ def main() -> int:
         t = threading.Thread(
             target=_register_worker,
             args=(wid, task_queue, args.count, args.accounts_file, mint_queue, forever, do_mint_inline),
+            kwargs={
+                "browser_client": browser_client,
+                "env_id": browser_env_ids[wid - 1],
+            },
             daemon=True,
             name=f"reg-{wid}",
         )
@@ -668,6 +730,8 @@ def main() -> int:
         reg.shutdown_browser()
     except Exception:
         pass
+    finally:
+        reg.TabPool.configure_browser_lifecycle(None, None)
 
     # stop side-effect pool
     try:

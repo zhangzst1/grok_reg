@@ -2,6 +2,18 @@
   "//_readme": "复制为本目录 config.json 后按需修改。以 // 或 # 开头的键是注释，加载时忽略。",
   "//_paths": "相对路径相对 grok_reg 目录；CPA 相关绝对路径更清晰。",
 
+  "// ===== CLI 注册浏览器环境 API =====": "",
+  "// browser_api_base": "仅 register_cli.py 使用；浏览器环境管理服务地址。",
+  "browser_api_base": "http://127.0.0.1:50326",
+  "// browser_api_token": "建议留空并通过 BROWSER_API_TOKEN 环境变量提供。",
+  "browser_api_token": "",
+  "// browser_env_ids": "每个 CLI 注册线程独占一个 env_id；实际线程数不会超过列表长度。",
+  "browser_env_ids": [900, 901],
+  "// browser_start_wait_seconds": "启动接口返回调试端口后等待浏览器就绪的秒数。",
+  "browser_start_wait_seconds": 3,
+  "// browser_api_timeout": "启动和停止接口的 HTTP 超时秒数。",
+  "browser_api_timeout": 30,
+
   "// ===== 邮箱：注册验证码来源 =====": "",
   "// email_provider": "cloudmail | cloudflare | duckmail | yyds | hotmail | outlookmail。推荐自建 cloudmail；若使用微软邮箱则选 hotmail/outlookmail。",
   "email_provider": "cloudmail",
