@@ -341,3 +341,70 @@ git diff -- cli_browser_env.py tab_pool.py register_cli.py config.example.json .
 ```
 
 Expected: only CLI registration browser integration, lifecycle hooks, configuration templates and tests are changed; GUI and CPA/OIDC creation code remains unchanged.
+
+### Task 5: Clear environment cookies before every browser start
+
+**Files:**
+- Modify: `cli_browser_env.py:93-152`
+- Modify: `tests/test_cli_browser_env.py:32-137`
+
+- [ ] **Step 1: Write failing request-order and failure tests**
+
+Update the successful lifecycle test to expect these requests in order:
+
+```python
+mock.call(
+    "http://127.0.0.1:50326/api/browser/cookie/update",
+    json={"envId": 900, "cookie": None},
+    headers=expected_headers,
+    timeout=30,
+),
+mock.call(
+    "http://127.0.0.1:50326/api/browser/start",
+    json={"envId": 900},
+    headers=expected_headers,
+    timeout=30,
+),
+mock.call(
+    "http://127.0.0.1:50326/api/browser/stop",
+    json={"envId": 900},
+    headers=expected_headers,
+    timeout=30,
+),
+```
+
+Add a test where `/cookie/update` raises an HTTP error and assert that `/start` is never called and the same env ID can be attempted again.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run:
+
+```powershell
+uv run python -m unittest tests.test_cli_browser_env.BrowserEnvApiClientTests -v
+```
+
+Expected: request-order assertions fail because the client currently starts the browser without a Cookie update.
+
+- [ ] **Step 3: Implement strict Cookie clearing**
+
+Add `_update_cookie(env_id)` that posts `{"envId": env_id, "cookie": None}`. Call it after reserving the env ID but before `/browser/start`. Track whether the start endpoint was attempted so a Cookie-update failure releases only the local reservation, while failures after `/start` still call `/browser/stop` best-effort.
+
+- [ ] **Step 4: Run focused and complete verification**
+
+Run:
+
+```powershell
+uv run python -m unittest tests.test_cli_browser_env.BrowserEnvApiClientTests -v
+uv run python -m unittest discover -s tests -v
+uv run python -m compileall -q register_cli.py grok_register_ttk.py cli_browser_env.py tab_pool.py cpa_xai utils tests
+git diff --check
+```
+
+Expected: all tests pass, compilation exits zero, and no whitespace errors are reported.
+
+- [ ] **Step 5: Commit the Cookie reset change**
+
+```powershell
+git add cli_browser_env.py tests/test_cli_browser_env.py docs/superpowers/plans/2026-07-14-cli-browser-env-api.md
+git commit -m "Clear browser environment cookies before CLI start"
+```

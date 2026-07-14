@@ -100,6 +100,16 @@ class BrowserEnvApiClient:
         response.raise_for_status()
         return response
 
+    def _update_cookie(self, env_id: int) -> None:
+        response = self.session.post(
+            f"{self.base_url}/api/browser/cookie/update",
+            json={"envId": env_id, "cookie": None},
+            headers=self.headers,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        self._log(f"[*] browser env cookies cleared: env_id={env_id}")
+
     def _stop_env(self, env_id: int, *, raise_errors: bool) -> None:
         try:
             self._post("stop", env_id)
@@ -120,7 +130,10 @@ class BrowserEnvApiClient:
                 raise RuntimeError(f"browser env_id already active: {env_id}")
             self._active_env_ids.add(env_id)
 
+        start_attempted = False
         try:
+            self._update_cookie(env_id)
+            start_attempted = True
             response = self._post("start", env_id)
             payload = response.json()
             try:
@@ -147,7 +160,11 @@ class BrowserEnvApiClient:
             )
             return browser
         except Exception as exc:
-            self._stop_env(env_id, raise_errors=False)
+            if start_attempted:
+                self._stop_env(env_id, raise_errors=False)
+            else:
+                with self._lock:
+                    self._active_env_ids.discard(env_id)
             if isinstance(exc, RuntimeError):
                 raise
             raise RuntimeError(f"failed to start browser env {env_id}: {exc}") from exc

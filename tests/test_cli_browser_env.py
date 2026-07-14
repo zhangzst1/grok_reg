@@ -5,6 +5,8 @@ import unittest
 import queue
 from unittest import mock
 
+import requests
+
 
 class BrowserEnvConfigurationTests(unittest.TestCase):
     def test_parse_env_ids_preserves_order(self) -> None:
@@ -36,10 +38,11 @@ class BrowserEnvApiClientTests(unittest.TestCase):
 
     def test_start_attaches_to_debug_port_and_stop_uses_same_env(self) -> None:
         session = mock.Mock()
+        cookie_response = mock.Mock()
         start_response = mock.Mock()
         start_response.json.return_value = {"data": {"port": 43210}}
         stop_response = mock.Mock()
-        session.post.side_effect = [start_response, stop_response]
+        session.post.side_effect = [cookie_response, start_response, stop_response]
         chromium = object()
         client = self.make_client(session)
         client.bind_worker(900)
@@ -61,6 +64,15 @@ class BrowserEnvApiClientTests(unittest.TestCase):
         session.post.assert_has_calls(
             [
                 mock.call(
+                    "http://127.0.0.1:50326/api/browser/cookie/update",
+                    json={"envId": 900, "cookie": None},
+                    headers={
+                        "Authorization": "Bearer secret",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=30,
+                ),
+                mock.call(
                     "http://127.0.0.1:50326/api/browser/start",
                     json={"envId": 900},
                     headers={
@@ -80,6 +92,7 @@ class BrowserEnvApiClientTests(unittest.TestCase):
                 ),
             ]
         )
+        cookie_response.raise_for_status.assert_called_once_with()
         start_response.raise_for_status.assert_called_once_with()
         stop_response.raise_for_status.assert_called_once_with()
 
@@ -117,12 +130,20 @@ class BrowserEnvApiClientTests(unittest.TestCase):
 
     def test_invalid_start_response_releases_reservation(self) -> None:
         session = mock.Mock()
+        first_cookie_response = mock.Mock()
         bad_response = mock.Mock()
         bad_response.json.return_value = {"data": {}}
         stop_response = mock.Mock()
+        second_cookie_response = mock.Mock()
         good_response = mock.Mock()
         good_response.json.return_value = {"data": {"port": 43210}}
-        session.post.side_effect = [bad_response, stop_response, good_response]
+        session.post.side_effect = [
+            first_cookie_response,
+            bad_response,
+            stop_response,
+            second_cookie_response,
+            good_response,
+        ]
         client = self.make_client(session)
         client.bind_worker(900)
 
@@ -135,6 +156,44 @@ class BrowserEnvApiClientTests(unittest.TestCase):
         ):
             options.return_value.set_local_port.return_value = options.return_value
             client.start_browser()
+
+    def test_cookie_update_failure_does_not_start_and_releases_reservation(self) -> None:
+        session = mock.Mock()
+        cookie_response = mock.Mock()
+        start_response = mock.Mock()
+        start_response.json.return_value = {"data": {"port": 43210}}
+        session.post.side_effect = [
+            requests.HTTPError("cookie update failed"),
+            cookie_response,
+            start_response,
+        ]
+        client = self.make_client(session)
+        client.bind_worker(900)
+
+        with self.assertRaisesRegex(RuntimeError, "cookie update failed"):
+            client.start_browser()
+
+        self.assertEqual(session.post.call_count, 1)
+        self.assertEqual(
+            session.post.call_args.args[0],
+            "http://127.0.0.1:50326/api/browser/cookie/update",
+        )
+
+        with (
+            mock.patch("cli_browser_env.ChromiumOptions") as options,
+            mock.patch("cli_browser_env.Chromium", return_value=object()),
+        ):
+            options.return_value.set_local_port.return_value = options.return_value
+            client.start_browser()
+
+        self.assertEqual(
+            [call.args[0] for call in session.post.call_args_list],
+            [
+                "http://127.0.0.1:50326/api/browser/cookie/update",
+                "http://127.0.0.1:50326/api/browser/cookie/update",
+                "http://127.0.0.1:50326/api/browser/start",
+            ],
+        )
 
 
 class TabPoolLifecycleHookTests(unittest.TestCase):
