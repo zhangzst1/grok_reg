@@ -28,6 +28,8 @@ class TabPool:
     _thread_local = threading.local()
     _all_browsers: list[Any] = []
     _all_browsers_lock = threading.Lock()
+    _browser_factory = None
+    _browser_releaser = None
 
     # ── public ──
 
@@ -44,11 +46,24 @@ class TabPool:
             log_callback("[*] TabPool 已初始化浏览器选项模板")
 
     @classmethod
+    def configure_browser_lifecycle(cls, factory=None, releaser=None):
+        """Set optional browser creation/release hooks for the current process."""
+        with cls._options_lock:
+            cls._browser_factory = factory
+            cls._browser_releaser = releaser
+
+    @classmethod
     def _create_browser(cls):
         from DrissionPage import Chromium
 
         with cls._options_lock:
             factory = cls._options_factory
+            browser_factory = cls._browser_factory
+        if browser_factory is not None:
+            browser = browser_factory()
+            with cls._all_browsers_lock:
+                cls._all_browsers.append(browser)
+            return browser
         if factory is None:
             return None
         options = factory()
@@ -56,6 +71,18 @@ class TabPool:
         with cls._all_browsers_lock:
             cls._all_browsers.append(browser)
         return browser
+
+    @classmethod
+    def _release_browser(cls, browser) -> None:
+        with cls._options_lock:
+            browser_releaser = cls._browser_releaser
+        if browser_releaser is not None:
+            browser_releaser(browser)
+            return
+        try:
+            browser.quit(del_data=True)
+        except TypeError:
+            browser.quit()
 
     @classmethod
     def _unregister(cls, browser) -> None:
@@ -193,12 +220,7 @@ class TabPool:
         browser = getattr(cls._thread_local, "browser", None)
         if browser is not None:
             try:
-                browser.quit(del_data=True)
-            except TypeError:
-                try:
-                    browser.quit()
-                except Exception:
-                    pass
+                cls._release_browser(browser)
             except Exception:
                 pass
             cls._unregister(browser)
@@ -221,12 +243,7 @@ class TabPool:
             cls._all_browsers.clear()
         for b in browsers:
             try:
-                b.quit(del_data=True)
-            except TypeError:
-                try:
-                    b.quit()
-                except Exception:
-                    pass
+                cls._release_browser(b)
             except Exception:
                 pass
 
