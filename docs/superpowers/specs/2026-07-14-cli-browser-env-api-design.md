@@ -49,12 +49,15 @@ min(--threads, browser_env_ids 数量)
 新增一个 CLI 专用模块，负责：
 
 - 保存当前线程绑定的 `env_id`。
+- 在每次启动或重启环境前调用 `POST {browser_api_base}/api/browser/cookie/update`，请求体为 `{"envId": env_id, "cookie": null}`。
 - 调用 `POST {browser_api_base}/api/browser/start`，请求体为 `{"envId": env_id}`。
 - 校验 HTTP 状态、JSON 结构和 `data.port`。
 - 等待 `browser_start_wait_seconds` 后，通过调试端口连接浏览器。
 - 调用 `POST {browser_api_base}/api/browser/stop`，请求体为 `{"envId": env_id}`。
 - 记录每个 `env_id` 的启动状态，阻止同一环境重复启动。
 - 在启动失败时回收内部状态；停止操作保持幂等。
+
+Cookie 更新是启动的强制前置步骤。更新失败时不调用启动接口，立即释放进程内的 `env_id` 占用状态并终止当前启动尝试。浏览器复用且没有重新启动时不重复调用更新接口。
 
 连接现有 DrissionPage 浏览器管理时使用：
 
@@ -97,6 +100,8 @@ CLI 结束时继续调用 `TabPool.shutdown()`，确保所有已启动的注册�
 - 配置两个 env ID、请求三个线程时，实际注册线程限制为两个。
 - 每个工作线程绑定不同 env ID。
 - 启动请求包含正确的 URL、Bearer Token 和 `envId`。
+- 启动调用顺序严格为 Cookie 更新、环境启动、环境停止；Cookie 字段发送为 JSON `null`。
+- Cookie 更新失败时不调用环境启动接口，并允许之后重新尝试同一 `env_id`。
 - 启动响应的调试端口传给 `ChromiumOptions.set_local_port()`。
 - 重启和线程退出调用对应 env ID 的停止接口。
 - 同一个 env ID 的重复启动被拒绝。
