@@ -1477,6 +1477,22 @@ def hotmail_get_email_and_token():
     random_max_attempts = max(10, random_max_attempts)
 
     with _hotmail_selection_lock:
+        # Prefer unused main mailboxes, then balance alias allocation by the
+        # number of addresses already consumed from each credential row.
+        ranked_accounts = []
+        for file_index, acc in enumerate(accounts):
+            main_email = acc["email"].strip()
+            if "@" not in main_email:
+                continue
+            consumed_count = _hotmail_count_consumed_for_main(main_email)
+            if consumed_count >= max_aliases:
+                continue
+            main_unavailable = not _hotmail_alias_available(main_email)
+            ranked_accounts.append(
+                (main_unavailable, consumed_count, file_index, acc)
+            )
+        accounts = [item[-1] for item in sorted(ranked_accounts)]
+
         for acc in accounts:
             main_email = acc["email"].strip()
             if "@" not in main_email:
