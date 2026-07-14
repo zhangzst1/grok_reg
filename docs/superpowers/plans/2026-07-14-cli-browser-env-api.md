@@ -327,7 +327,7 @@ Expected: all tests pass, compilation exits zero, and `git diff --check` reports
 Run:
 
 ```powershell
-rg -n -S "asp_edea250d125d1335c1fa6f3e235b998525fe8c40174d7706|Bearer secret" . --glob '!.git/**' --glob '!docs/superpowers/plans/**'
+rg -n -S "YOUR_API_KEY|Bearer secret" . --glob '!.git/**' --glob '!docs/superpowers/plans/**'
 ```
 
 Expected: no real API Token in source or configuration templates.
