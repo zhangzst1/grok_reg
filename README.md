@@ -76,7 +76,7 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 运行时行为摘要：
 
 - 运行时只读取并选择 `mail_credentials.txt` 中尚未使用的主邮箱，不创建临时邮箱，也不生成 plus alias
-- `email_provider` 运行时仅支持 `hotmail` / `outlookmail`；DuckMail、YYDS、Cloudflare、CloudMail 会直接提示“邮箱自动生成已禁用”
+- `email_provider` 默认使用 `hotmail` / `outlookmail`；YYDS 只有在 `allow_yyds_generation=true` 时才会创建临时邮箱，其他临时邮箱提供商仍会被禁用
 - `hotmail_code_mode=manual`（默认）：CLI 在终端提示输入验证码，GUI 弹出输入框；支持 `ABC-123` 或 `ABC123`
 - CLI 多线程会串行显示输入提示；GUI 多线程会逐个显示验证码窗口，提示中包含目标邮箱
 - `hotmail_code_mode=imap`：经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP 自动拉验证码
@@ -96,6 +96,20 @@ uv run python scripts/generate_hotmail_aliases.py --output generated_aliases.txt
 脚本默认从 `mail_credentials.txt` 读取每个主邮箱，并为每个主邮箱生成 4 个 8 位随机 alias；输出按轮次交错排列，例如 `邮箱1_第1个、邮箱2_第1个、邮箱3_第1个、邮箱1_第2个……`。每行保留原主邮箱对应的凭据，格式为 `生成邮箱----password----clientId----refresh_token`。可用 `--input`、`--count`、`--length` 覆盖默认值。
 
 相关配置见 `config.example.json` 中 `hotmail_*` 注释键。
+
+### YYDS Mail（显式开启）
+
+YYDS 使用官方 `https://maliapi.215.im/v1` API。默认不会创建临时邮箱；如需启用，在 `config.json` 中设置：
+
+```json
+{
+  "email_provider": "yyds",
+  "allow_yyds_generation": true,
+  "yyds_api_key": "AC-your_api_key"
+}
+```
+
+创建接口使用官方 `localPart` 字段，并保存响应返回的最终 `address` 和临时 token；验证码读取使用邮箱地址查询消息。官方文档见 [YYDS Mail API 文档](https://vip.215.im/docs)。
 
 ### 2. 协议 OIDC → CPA（失败回退浏览器）
 

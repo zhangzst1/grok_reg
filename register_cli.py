@@ -289,7 +289,7 @@ def register_one(
             log(worker_id, f"--- 第 {idx}/{total} 个账号, 邮箱尝试 {mail_try}/{max_mail_retry} ---")
             log(worker_id, "1. 打开注册页")
             reg.open_signup_page(log_callback=lambda m: log(worker_id, m), cancel_callback=cancel)
-            log(worker_id, "2. 创建邮箱并提交")
+            log(worker_id, "2. 选择已有邮箱并提交")
             email, dev_token = reg.fill_email_and_submit(
                 log_callback=lambda m: log(worker_id, m), cancel_callback=cancel
             )
@@ -315,7 +315,7 @@ def register_one(
                     pass
                 reg.sleep_with_cancel(1, cancel)
                 continue
-            log(worker_id, f"! 邮箱阶段失败: {msg}")
+            log(worker_id, f"! 邮箱阶段失败: 邮箱={email or '未分配'} 原因={msg}")
             _mark_email_stage_error(email, msg)
             traceback.print_exc()
             _inc("reg_fail")
@@ -400,7 +400,7 @@ def register_one(
         _inc("reg_success")
         return job
     except Exception as exc:
-        log(worker_id, f"! 注册失败: {exc}")
+        log(worker_id, f"! 注册失败: 邮箱={email or '未分配'} 原因={exc}")
         reg.mark_error(email or "", reason=str(exc)[:120])
         traceback.print_exc()
         _inc("reg_fail")
@@ -481,39 +481,18 @@ def _register_worker(
                 task_queue.put(i)
             continue
 
-        retry = 0
-        while retry < 2:
-            try:
-                result = register_one(
-                    worker_id,
-                    idx,
-                    total,
-                    accounts_file,
-                    do_mint_inline=do_mint_inline,
-                    mint_queue=mint_queue,
-                )
-                if result:
-                    break
-                retry += 1
-                if retry < 2:
-                    log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
-                    try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-                    except Exception:
-                        pass
-            except Exception:
-                retry += 1
-                if retry < 2:
-                    log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
-                    traceback.print_exc()
-                    try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-                    except Exception:
-                        pass
-
-        if retry >= 2:
-            # register_one already counted fail on exception path; if both returned None, count once more only if needed
-            pass
+        try:
+            register_one(
+                worker_id,
+                idx,
+                total,
+                accounts_file,
+                do_mint_inline=do_mint_inline,
+                mint_queue=mint_queue,
+            )
+        except Exception as exc:
+            log(worker_id, f"[failed] 账号 {idx} 异常，已停止本账号: {exc}")
+            traceback.print_exc()
 
     # worker exit: free browser
     try:

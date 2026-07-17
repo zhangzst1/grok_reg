@@ -178,18 +178,12 @@ class ManualVerificationCodeTests(unittest.TestCase):
         self.assertFalse(reg.should_retry_verification_error("手动验证码输入已取消"))
 
 
-class HotmailAliasSelectionTests(unittest.TestCase):
+class HotmailMainMailboxSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_config = dict(reg.config)
         self.original_reserved = set(reg._hotmail_reserved_aliases)
         self.original_token_map = dict(reg._hotmail_token_map)
-        reg.config.update(
-            {
-                "email_provider": "hotmail",
-                "hotmail_alias_mode": "random",
-                "hotmail_max_aliases_per_account": 5,
-            }
-        )
+        reg.config["email_provider"] = "hotmail"
         reg._hotmail_reserved_aliases.clear()
         reg._hotmail_token_map.clear()
 
@@ -201,14 +195,13 @@ class HotmailAliasSelectionTests(unittest.TestCase):
         reg._hotmail_token_map.clear()
         reg._hotmail_token_map.update(self.original_token_map)
 
-    def test_prefers_next_main_mailbox_before_creating_alias(self) -> None:
+    def test_selects_each_unused_main_mailbox_once(self) -> None:
         accounts = [
             {"email": "first@hotmail.com"},
             {"email": "second@hotmail.com"},
         ]
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=accounts),
-            mock.patch.object(reg, "_hotmail_count_consumed_for_main", return_value=0),
             mock.patch.object(reg, "is_email_used", return_value=False),
         ):
             first_email, _ = reg.hotmail_get_email_and_token()
@@ -217,39 +210,27 @@ class HotmailAliasSelectionTests(unittest.TestCase):
         self.assertEqual(first_email, "first@hotmail.com")
         self.assertEqual(second_email, "second@hotmail.com")
 
-    def test_concurrent_aliases_are_balanced_across_main_mailboxes(self) -> None:
+    def test_concurrent_workers_reserve_distinct_main_mailboxes(self) -> None:
         accounts = [
             {"email": "first@hotmail.com"},
             {"email": "second@hotmail.com"},
         ]
 
-        def is_email_used(email: str) -> bool:
-            return "+" not in email.split("@", 1)[0]
-
-        def consumed_count(main_email: str) -> int:
-            main_local, main_domain = main_email.lower().split("@", 1)
-            reserved_count = sum(
-                1
-                for email in reg._hotmail_reserved_aliases
-                if email.startswith(main_local + "+")
-                and email.endswith("@" + main_domain)
-            )
-            return 1 + reserved_count
-
         allocated: list[str] = []
+        errors: list[Exception] = []
+
+        def allocate() -> None:
+            try:
+                allocated.append(reg.hotmail_get_email_and_token()[0])
+            except Exception as exc:
+                errors.append(exc)
+
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=accounts),
-            mock.patch.object(
-                reg,
-                "_hotmail_count_consumed_for_main",
-                side_effect=consumed_count,
-            ),
-            mock.patch.object(reg, "is_email_used", side_effect=is_email_used),
+            mock.patch.object(reg, "is_email_used", return_value=False),
         ):
             threads = [
-                threading.Thread(
-                    target=lambda: allocated.append(reg.hotmail_get_email_and_token()[0])
-                )
+                threading.Thread(target=allocate)
                 for _ in range(2)
             ]
             for thread in threads:
@@ -257,14 +238,9 @@ class HotmailAliasSelectionTests(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=2)
 
-        allocated_mains = {
-            email.split("+", 1)[0] + "@" + email.rsplit("@", 1)[1]
-            for email in allocated
-        }
-        self.assertEqual(
-            allocated_mains,
-            {"first@hotmail.com", "second@hotmail.com"},
-        )
+        self.assertEqual(errors, [])
+        self.assertEqual(set(allocated), {"first@hotmail.com", "second@hotmail.com"})
+        self.assertTrue(all("+" not in email.split("@", 1)[0] for email in allocated))
 
 
 class MailRetryConfigurationTests(unittest.TestCase):

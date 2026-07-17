@@ -29,6 +29,9 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 DEFAULT_CONFIG = {
     "email_provider": "hotmail",
+    "allow_yyds_generation": False,
+    "yyds_api_key": "",
+    "yyds_jwt": "",
     "duckmail_api_key": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
@@ -857,6 +860,11 @@ def get_yyds_jwt():
     return config.get("yyds_jwt", "")
 
 
+def yyds_generation_allowed():
+    """Return whether YYDS temporary-mail creation is explicitly enabled."""
+    return config.get("allow_yyds_generation", False) is True
+
+
 def yyds_get_domains(api_key=None, jwt=None):
     key = api_key or get_yyds_api_key()
     token = jwt or get_yyds_jwt()
@@ -871,7 +879,14 @@ def yyds_get_domains(api_key=None, jwt=None):
     return data.get("data", []) if data.get("success") else []
 
 
-def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
+def yyds_create_account(
+    local_part=None,
+    domain='dzpw.uno',
+    subdomain=None,
+    api_key=None,
+    jwt=None,
+    address=None,
+):
     key = api_key or get_yyds_api_key()
     token = jwt or get_yyds_jwt()
     headers = {"Content-Type": "application/json"}
@@ -880,28 +895,29 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
     elif key:
         headers["X-API-Key"] = key
     payload = {}
-    if address:
+    if local_part:
+        payload["localPart"] = local_part
+    elif address:
         payload["address"] = address
     if domain:
         payload["domain"] = domain
     elif key or token:
         payload["autoDomainStrategy"] = "prefer_owned"
+    if subdomain:
+        payload["subdomain"] = subdomain
     resp = http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鍒涘缓閭澶辫触: {data}")
+    raise Exception(f"YYDS 创建邮箱失败: {data}")
 
 
-def yyds_get_token(address, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
+def yyds_get_token(address, temp_token):
+    if not temp_token:
+        raise ValueError("YYDS 刷新 token 需要当前有效的临时 token")
     headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
+    headers["Authorization"] = f"Bearer {temp_token}"
     resp = http_post(
         f"{YYDS_API_BASE}/token", json={"address": address}, headers=headers
     )
@@ -909,7 +925,7 @@ def yyds_get_token(address, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 鑾峰彇token澶辫触: {data}")
+    raise Exception(f"YYDS 获取临时 token 失败: {data}")
 
 
 def yyds_get_messages(address, token=None, api_key=None, jwt=None):
@@ -928,11 +944,17 @@ def yyds_get_messages(address, token=None, api_key=None, jwt=None):
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
-        return data.get("data", {}).get("messages", [])
+        payload = data.get("data", {})
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            return payload.get("messages", [])
     return []
 
 
-def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
+def yyds_get_message_detail(
+    message_id, token=None, api_key=None, jwt=None, address=None
+):
     key = api_key or get_yyds_api_key()
     temp_token = token or jwt or get_yyds_jwt()
     headers = {}
@@ -940,12 +962,15 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {temp_token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
+    request_kwargs = {"headers": headers}
+    if address:
+        request_kwargs["params"] = {"address": address}
+    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", **request_kwargs)
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鑾峰彇閭欢璇︽儏澶辫触: {data}")
+    raise Exception(f"YYDS 获取邮件详情失败: {data}")
 
 
 def yyds_generate_username(length=10):
@@ -956,7 +981,7 @@ def yyds_generate_username(length=10):
 def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("YYDS 没有返回可用域名")
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
     if private:
         return private[0]["domain"]
@@ -966,7 +991,7 @@ def yyds_pick_domain(api_key=None, jwt=None):
     verified = [d for d in domains if d.get("isVerified")]
     if verified:
         return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("YYDS 没有已验证的可用域名")
 
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
@@ -977,15 +1002,13 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     domain = yyds_pick_domain(api_key=key, jwt=token)
     username = yyds_generate_username(10)
     result = yyds_create_account(
-        address=username, domain=domain, api_key=key, jwt=token
+        local_part=username, domain=domain, api_key=key, jwt=token
     )
     address = result.get("address") or f"{username}@{domain}"
     temp_token = result.get("token")
     if not temp_token:
-        temp_token = yyds_get_token(address, api_key=key, jwt=token)
-    if not temp_token:
-        raise Exception("鑾峰彇 YYDS token 澶辫触")
-    print(f"[*] 宸插垱寤?YYDS 閭: {address}")
+        raise Exception("YYDS 创建响应缺少临时 token")
+    print(f"[*] 已创建 YYDS 临时邮箱: {address}")
     return address, temp_token
 
 
@@ -1006,7 +1029,7 @@ def yyds_get_oai_code(
             messages = yyds_get_messages(address, token=token, jwt=jwt)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] YYDS 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] YYDS 获取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -1017,12 +1040,27 @@ def yyds_get_oai_code(
             to_addrs = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             if address.lower() not in to_addrs:
                 continue
+            server_code = str(msg.get("verificationCode") or "").strip()
+            if server_code:
+                if log_callback:
+                    log_callback(f"[*] YYDS 已从消息列表获取验证码: {server_code}")
+                return server_code
             try:
-                detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
+                detail = yyds_get_message_detail(
+                    msg_id,
+                    token=token,
+                    jwt=jwt,
+                    address=address,
+                )
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] YYDS 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
                 continue
+            server_code = str(detail.get("verificationCode") or "").strip()
+            if server_code:
+                if log_callback:
+                    log_callback(f"[*] YYDS 已获取服务端验证码: {server_code}")
+                return server_code
             parts = []
             text_body = detail.get("text") or ""
             if text_body:
@@ -1033,11 +1071,11 @@ def yyds_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] YYDS 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
-                    log_callback(f"[*] YYDS 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
+                    log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
@@ -1747,6 +1785,12 @@ def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider in ("hotmail", "outlook", "outlookmail", "microsoft"):
         return hotmail_get_email_and_token()
+    if provider == "yyds":
+        if not yyds_generation_allowed():
+            raise RuntimeError(
+                "YYDS 临时邮箱生成默认禁用；请显式设置 allow_yyds_generation=true"
+            )
+        return yyds_get_email_and_token(api_key=api_key, jwt=None)
     raise RuntimeError(
         "邮箱自动生成已禁用；请将 email_provider 设置为 hotmail/outlookmail，"
         "并在 mail_credentials.txt 中提供已有邮箱"
@@ -3443,10 +3487,10 @@ class GrokRegisterGUI:
         config_frame.pack(fill=tk.X, pady=5)
         ttk.Label(config_frame, text="邮箱服务商:").grid(row=0, column=0, sticky=tk.W)
         configured_provider = get_email_provider()
-        if configured_provider not in ("hotmail", "outlookmail"):
+        if configured_provider not in ("hotmail", "outlookmail", "yyds"):
             configured_provider = "hotmail"
         self.email_provider_var = tk.StringVar(value=configured_provider)
-        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["hotmail", "outlookmail"], width=12, state="readonly")
+        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["hotmail", "outlookmail", "yyds"], width=12, state="readonly")
         self.email_provider_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="注册数量:").grid(row=0, column=2, sticky=tk.W, padx=10)
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
@@ -3463,10 +3507,21 @@ class GrokRegisterGUI:
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
         self.proxy_entry = ttk.Entry(config_frame, textvariable=self.proxy_var, width=30)
         self.proxy_entry.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="DuckMail API Key:").grid(row=3, column=0, sticky=tk.W)
-        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
-        self.api_key_entry = ttk.Entry(config_frame, textvariable=self.api_key_var, width=30)
-        self.api_key_entry.grid(row=3, column=1, columnspan=3, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="YYDS API Key:").grid(row=3, column=0, sticky=tk.W)
+        self.yyds_api_key_var = tk.StringVar(value=config.get("yyds_api_key", ""))
+        self.yyds_api_key_entry = ttk.Entry(
+            config_frame, textvariable=self.yyds_api_key_var, width=24
+        )
+        self.yyds_api_key_entry.grid(row=3, column=1, columnspan=2, sticky=tk.W, padx=5)
+        self.allow_yyds_generation_var = tk.BooleanVar(
+            value=yyds_generation_allowed()
+        )
+        self.allow_yyds_generation_check = ttk.Checkbutton(
+            config_frame,
+            text="允许 YYDS 创建临时邮箱",
+            variable=self.allow_yyds_generation_var,
+        )
+        self.allow_yyds_generation_check.grid(row=3, column=3, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="Cloudflare API Base:").grid(row=4, column=0, sticky=tk.W)
         self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
         self.cloudflare_api_base_entry = ttk.Entry(config_frame, textvariable=self.cloudflare_api_base_var, width=30)
@@ -3621,12 +3676,13 @@ class GrokRegisterGUI:
         return """欢迎使用 Grok 注册机。建议按下面顺序填写（从最关键到可选）：
 
 【第一步：填写已有邮箱配置】
-1) 邮箱服务商仅支持 hotmail / outlookmail
+1) 邮箱服务商支持 hotmail / outlookmail，以及显式开启的 yyds
 - Hotmail账号文件默认: mail_credentials.txt
 - 每行格式: your@hotmail.com----mailPassword----client-id----refresh-token
 - 注册运行时只读取并选择主邮箱，不创建临时邮箱，也不生成 plus alias
 - 验证码方式 manual（默认）会弹窗手动输入；imap 才通过 XOAUTH2 IMAP 自动收码
 - 需要离线准备 alias 时，运行 scripts/generate_hotmail_aliases.py
+- YYDS 必须勾选“允许 YYDS 创建临时邮箱”并配置 AC- 开头的 API Key
 
 【第三步：并发与稳定性】
 6) 注册数量
@@ -3777,7 +3833,10 @@ class GrokRegisterGUI:
 
         config["email_provider"] = self.email_provider_var.get().strip() or "hotmail"
         config["proxy"] = self.proxy_var.get().strip()
-        config["duckmail_api_key"] = self.api_key_var.get().strip()
+        config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
+        config["allow_yyds_generation"] = bool(
+            self.allow_yyds_generation_var.get()
+        )
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "bearer"
@@ -3821,6 +3880,13 @@ class GrokRegisterGUI:
             hotmail_path = get_hotmail_accounts_file()
             if not os.path.exists(hotmail_path):
                 self.log(f"[!] Hotmail/Outlook 模式账号文件不存在: {hotmail_path}")
+                return
+        if config["email_provider"] == "yyds":
+            if not yyds_generation_allowed():
+                self.log("[!] YYDS 模式需要在 config.json 设置 allow_yyds_generation=true")
+                return
+            if not get_yyds_api_key() and not get_yyds_jwt():
+                self.log("[!] YYDS 模式需要配置 yyds_api_key 或 yyds_jwt")
                 return
         try:
             count = int(self.count_var.get())

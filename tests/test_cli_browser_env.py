@@ -309,5 +309,73 @@ class CliBrowserEnvironmentTests(unittest.TestCase):
         client.bind_worker.assert_called_once_with(901)
 
 
+class CliRegistrationFailureTests(unittest.TestCase):
+    def test_failed_account_is_not_retried(self) -> None:
+        import register_cli as cli
+
+        task_queue = queue.Queue()
+        task_queue.put(61)
+        with (
+            mock.patch.object(cli, "register_one", return_value=None) as register_one,
+            mock.patch.object(cli.reg, "restart_browser") as restart_browser,
+            mock.patch.object(cli.reg, "stop_browser"),
+            mock.patch.object(cli, "log") as log,
+        ):
+            cli._register_worker(
+                2,
+                task_queue,
+                61,
+                "accounts_cli.txt",
+                None,
+                False,
+                False,
+            )
+
+        register_one.assert_called_once_with(
+            2,
+            61,
+            61,
+            "accounts_cli.txt",
+            do_mint_inline=False,
+            mint_queue=None,
+        )
+        restart_browser.assert_not_called()
+        messages = [call.args[1] for call in log.call_args_list if len(call.args) > 1]
+        self.assertFalse(any("[retry]" in message for message in messages))
+
+    def test_email_stage_failure_logs_the_failed_email(self) -> None:
+        import register_cli as cli
+
+        failed_email = "failed@hotmail.com"
+        with (
+            mock.patch.object(cli, "_ensure_browser"),
+            mock.patch.object(cli.reg, "get_mail_attempt_count", return_value=1),
+            mock.patch.object(cli.reg, "open_signup_page"),
+            mock.patch.object(
+                cli.reg,
+                "fill_email_and_submit",
+                return_value=(failed_email, "token"),
+            ),
+            mock.patch.object(
+                cli.reg,
+                "fill_code_and_submit",
+                side_effect=RuntimeError("验证码阶段失败"),
+            ),
+            mock.patch.object(cli.reg, "should_retry_verification_error", return_value=False),
+            mock.patch.object(cli.reg, "restart_browser"),
+            mock.patch.object(cli.reg, "mark_error") as mark_error,
+            mock.patch.object(cli.traceback, "print_exc"),
+            mock.patch.object(cli, "log") as log,
+        ):
+            result = cli.register_one(2, 61, 61, "accounts_cli.txt")
+
+        self.assertIsNone(result)
+        mark_error.assert_called_once_with(failed_email, reason="验证码阶段失败")
+        messages = [call.args[1] for call in log.call_args_list if len(call.args) > 1]
+        self.assertTrue(
+            any(failed_email in message and "邮箱阶段失败" in message for message in messages)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
