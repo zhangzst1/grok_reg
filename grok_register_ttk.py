@@ -28,6 +28,7 @@ from curl_cffi import requests
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 DEFAULT_CONFIG = {
+    "email_provider": "hotmail",
     "duckmail_api_key": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
@@ -55,10 +56,6 @@ DEFAULT_CONFIG = {
     "cpa_gui_close_mint_browser": True,
     "hotmail_accounts_file": "mail_credentials.txt",
     "hotmail_code_mode": "manual",
-    "hotmail_alias_mode": "random",
-    "hotmail_alias_random_length": 8,
-    "hotmail_alias_random_max_attempts": 200,
-    "hotmail_max_aliases_per_account": 5,
     "hotmail_poll_interval": 5,
     "hotmail_recent_seconds": 900,
     "hotmail_imap_hosts": "outlook.office365.com,imap-mail.outlook.com",
@@ -1389,151 +1386,32 @@ def _hotmail_load_accounts(force=False):
         return _hotmail_accounts_cache
 
 
-def _hotmail_split_email_addr(email_addr):
-    raw = str(email_addr or "").strip().lower()
-    if "@" not in raw:
-        return "", ""
-    local, domain = raw.rsplit("@", 1)
-    return local, domain
-
-
-def _hotmail_is_alias_of_main(email_addr, main_email):
-    local, domain = _hotmail_split_email_addr(email_addr)
-    main_local, main_domain = _hotmail_split_email_addr(main_email)
-    if not local or not main_local or domain != main_domain:
-        return False
-    return local == main_local or local.startswith(main_local + "+")
-
-
-def _hotmail_iter_tracked_emails():
-    """Yield emails already persisted in success/error ledgers."""
-    for fpath in (_EMAILS_USED_FILE, _EMAILS_ERROR_FILE):
-        if not os.path.exists(fpath):
-            continue
-        try:
-            with open(fpath, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    email_addr = line.split("----", 1)[0].strip()
-                    if email_addr:
-                        yield email_addr
-        except Exception:
-            continue
-
-
-def _hotmail_count_consumed_for_main(main_email):
-    """Count used/failed/reserved aliases belonging to one Hotmail main mailbox."""
-    consumed = set()
-    for email_addr in _hotmail_iter_tracked_emails():
-        if _hotmail_is_alias_of_main(email_addr, main_email):
-            consumed.add(email_addr.strip().lower())
-    for email_addr in _hotmail_reserved_aliases:
-        if _hotmail_is_alias_of_main(email_addr, main_email):
-            consumed.add(email_addr.strip().lower())
-    return len(consumed)
-
-
 def _hotmail_alias_available(alias_email):
     alias_key = alias_email.strip().lower()
     return alias_key and alias_key not in _hotmail_reserved_aliases and not is_email_used(alias_email)
 
 
-def _hotmail_random_suffix(main_local):
-    try:
-        configured_len = int(config.get("hotmail_alias_random_length", 8) or 8)
-    except Exception:
-        configured_len = 8
-    # Outlook local-part max is 64 chars; keep suffix valid even for long usernames.
-    max_len = max(1, 64 - len(str(main_local or "")) - 1)
-    length = max(1, min(configured_len, max_len))
-    alphabet = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def _hotmail_make_alias(main_email, alias_index, *, randomize=False):
-    if alias_index <= 0:
-        return main_email
-    local, domain = main_email.split("@", 1)
-    if randomize:
-        return f"{local}+{_hotmail_random_suffix(local)}@{domain}"
-    return f"{local}+{alias_index}@{domain}"
-
-
 def hotmail_get_email_and_token():
     accounts = _hotmail_load_accounts()
-    try:
-        max_aliases = int(config.get("hotmail_max_aliases_per_account", 5) or 5)
-    except Exception:
-        max_aliases = 5
-    max_aliases = max(1, max_aliases)
-    alias_mode = str(config.get("hotmail_alias_mode", "random") or "random").strip().lower()
-    random_mode = alias_mode in ("random", "rand", "随机")
-    try:
-        random_max_attempts = int(config.get("hotmail_alias_random_max_attempts", 200) or 200)
-    except Exception:
-        random_max_attempts = 200
-    random_max_attempts = max(10, random_max_attempts)
-
     with _hotmail_selection_lock:
-        # Prefer unused main mailboxes, then balance alias allocation by the
-        # number of addresses already consumed from each credential row.
-        ranked_accounts = []
-        for file_index, acc in enumerate(accounts):
-            main_email = acc["email"].strip()
-            if "@" not in main_email:
-                continue
-            consumed_count = _hotmail_count_consumed_for_main(main_email)
-            if consumed_count >= max_aliases:
-                continue
-            main_unavailable = not _hotmail_alias_available(main_email)
-            ranked_accounts.append(
-                (main_unavailable, consumed_count, file_index, acc)
-            )
-        accounts = [item[-1] for item in sorted(ranked_accounts)]
-
         for acc in accounts:
             main_email = acc["email"].strip()
             if "@" not in main_email:
                 continue
-            if _hotmail_count_consumed_for_main(main_email) >= max_aliases:
+            if not _hotmail_alias_available(main_email):
                 continue
 
-            candidate = None
-            # 原邮箱仍优先尝试一次；之后 random 模式使用随机 plus alias。
-            if _hotmail_alias_available(main_email):
-                candidate = main_email
-            elif random_mode:
-                for _ in range(random_max_attempts):
-                    if _hotmail_count_consumed_for_main(main_email) >= max_aliases:
-                        break
-                    alias_email = _hotmail_make_alias(main_email, 1, randomize=True)
-                    if _hotmail_alias_available(alias_email):
-                        candidate = alias_email
-                        break
-            else:
-                for alias_index in range(1, max_aliases):
-                    alias_email = _hotmail_make_alias(main_email, alias_index)
-                    if _hotmail_alias_available(alias_email):
-                        candidate = alias_email
-                        break
-
-            if not candidate:
-                continue
-
-            alias_key = candidate.lower()
-            _hotmail_reserved_aliases.add(alias_key)
+            _hotmail_reserved_aliases.add(main_email.lower())
             token_key = "hotmail:" + secrets.token_urlsafe(18)
             _hotmail_token_map[token_key] = {
                 "account": acc,
-                "email": candidate,
+                "email": main_email,
                 "created_at": time.time(),
             }
-            return candidate, token_key
-    raise Exception(
-        "Hotmail/Outlook 可用别名已耗尽：请增加 hotmail_max_aliases_per_account、"
-        "补充 mail_credentials.txt，或清理 emails_used.txt / emails_error.txt"
+            return main_email, token_key
+    raise RuntimeError(
+        "Hotmail/Outlook 无可用主邮箱；自动 alias 生成已禁用，请补充或清理 mail_credentials.txt、"
+        "emails_used.txt 和 emails_error.txt"
     )
 
 
@@ -1829,7 +1707,7 @@ def hotmail_get_oai_code(
 # ──────────────────────── 公共邮箱工具 ────────────────────────
 
 def get_email_provider():
-    return str(config.get("email_provider", "duckmail") or "duckmail").strip().lower()
+    return str(config.get("email_provider", "hotmail") or "hotmail").strip().lower()
 
 
 def normalize_manual_verification_code(value):
@@ -1869,61 +1747,10 @@ def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider in ("hotmail", "outlook", "outlookmail", "microsoft"):
         return hotmail_get_email_and_token()
-    if provider == "yyds":
-        return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
-    if provider == "cloudmail":
-        # CloudMail catch-all 模式：直接生成随机邮箱，无需注册
-        # Cloudflare Email Routing 会自动将所有该域名的邮件路由到 Worker
-        # 支持英文逗号、中文逗号、空格分隔
-        raw = str(config.get("defaultDomains", "") or "")
-        domains = [x.strip() for x in re.split(r"[,，\s]+", raw) if x.strip()]
-        if not domains:
-            raise Exception("CloudMail 需要在 defaultDomains 中配置可用域名")
-        global _cf_domain_index
-        domain = domains[_cf_domain_index % len(domains)]
-        _cf_domain_index += 1
-        username = generate_username(10)
-        address = f"{username}@{domain}"
-        # 返回占位 token（实际不用于邮件查询，邮件查询走公开 API）
-        return address, "cloudmail_catch_all"
-    if provider == "cloudflare":
-        api_base = get_cloudflare_api_base()
-        if not api_base:
-            raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
-        except Exception as primary_exc:
-            # 兜底回退到 Mail.tm 风格
-            key = api_key or get_cloudflare_api_key()
-            domains = cloudflare_get_domains(api_base, api_key=key)
-            if not domains:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
-            domain = target.get("domain")
-            if not domain:
-                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-            username = generate_username(10)
-            address = f"{username}@{domain}"
-            password = secrets.token_urlsafe(12)
-            cloudflare_create_account(
-                api_base, address, password, api_key=key, expires_in=0
-            )
-            token = cloudflare_get_token(api_base, address, password, api_key=key)
-            if not token:
-                raise Exception("获取 Cloudflare 邮箱 token 失败")
-            return address, token
-    key = api_key or get_duckmail_api_key()
-    domain = pick_domain(api_key=key)
-    username = generate_username(10)
-    address = f"{username}@{domain}"
-    password = secrets.token_urlsafe(12)
-    create_account(address, password, api_key=key, expires_in=0)
-    token = get_token(address, password)
-    if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
-    return address, token
+    raise RuntimeError(
+        "邮箱自动生成已禁用；请将 email_provider 设置为 hotmail/outlookmail，"
+        "并在 mail_credentials.txt 中提供已有邮箱"
+    )
 
 
 def get_oai_code(
@@ -3615,8 +3442,11 @@ class GrokRegisterGUI:
         config_frame = ttk.LabelFrame(main_frame, text="配置", padding=10)
         config_frame.pack(fill=tk.X, pady=5)
         ttk.Label(config_frame, text="邮箱服务商:").grid(row=0, column=0, sticky=tk.W)
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["duckmail", "yyds", "cloudflare", "cloudmail", "hotmail", "outlookmail"], width=12, state="readonly")
+        configured_provider = get_email_provider()
+        if configured_provider not in ("hotmail", "outlookmail"):
+            configured_provider = "hotmail"
+        self.email_provider_var = tk.StringVar(value=configured_provider)
+        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["hotmail", "outlookmail"], width=12, state="readonly")
         self.email_provider_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="注册数量:").grid(row=0, column=2, sticky=tk.W, padx=10)
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
@@ -3790,58 +3620,13 @@ class GrokRegisterGUI:
     def _tutorial_text(self):
         return """欢迎使用 Grok 注册机。建议按下面顺序填写（从最关键到可选）：
 
-【第一步：先确定邮箱后端信息从哪里来】
-如果你使用 cloudflare 模式（你当前主要是这套），先去你的临时邮箱服务配置接口查信息：
-- 常见接口: /open_api/settings、/api/settings、/health_check
-- 重点字段:
-  - api_base（对应本工具的 Cloudflare API Base）
-  - domains / defaultDomains（可用域名）
-  - needAuth（是否需要鉴权）
-  - admin_password 或 api_key（需要鉴权时使用）
-  - provider.type（应为 cloudflare_temp_email）
-
-【第二步：先填最小可运行配置】
-1) 邮箱服务商
-- duckmail: 需要 DuckMail API Key
-- yyds: 需要 YYDS API Key 或 JWT
-- cloudflare: 需要 Cloudflare API Base（cloudflare_temp_email 临时邮箱）
-- cloudmail: 需要 CloudMail URL + 密码 + defaultDomains（maillab/cloud-mail 完整邮箱）
-- hotmail/outlookmail: 需要 Hotmail账号文件，格式为 邮箱----密码----ClientID----Token
-
-2) Cloudflare API Base（cloudflare 模式必填）
-- 示例: https://xxxx.pages.dev
-- 填写规则: 与 settings 接口中的 api_base 保持一致
-
-3) 默认域名(defaultDomains)
-- 填写你要优先使用的域名
-- 支持单域名或逗号分隔多域名轮换
-- 示例: a.com,b.com
-
-4) CF 路径(domains/accounts/token/messages)
-- 必须与后端真实路由一致
-- 常见新路径:
-  - /api/domains,/api/new_address,/api/token,/api/mails
-- 常见旧路径:
-  - /domains,/accounts,/token,/messages
-
-5) Cloudflare API Key / 鉴权模式
-- needAuth=false: 通常鉴权模式选 none，key 可留空
-- needAuth=true: 按后端要求填 key，并选择 bearer/x-api-key/query-key
-
-6) CloudMail 模式配置（maillab/cloud-mail 部署）
-- CloudMail URL: 你的 Worker 地址，如 https://mail.xxx.workers.dev
-- CloudMail 管理员邮箱: 管理员账号，如 admin@yourdomain.com
-- CloudMail 管理员密码: 管理员密码（用于获取公开 API token 查询邮件）
-- defaultDomains: 必须填写可用域名，如 yourdomain.com
-- 前提: CloudMail 管理面板需关闭注册验证码（Turnstile），或确保注册接口可用
-- 邮件获取: 通过 /api/public/emailList 公开接口查询，自动刷新 token
-
-7) Hotmail/Outlook 模式配置
+【第一步：填写已有邮箱配置】
+1) 邮箱服务商仅支持 hotmail / outlookmail
 - Hotmail账号文件默认: mail_credentials.txt
 - 每行格式: your@hotmail.com----mailPassword----client-id----refresh-token
-- 默认先用原邮箱，后续使用随机 plus alias（如 name+k8s2p9qa@domain）
+- 注册运行时只读取并选择主邮箱，不创建临时邮箱，也不生成 plus alias
 - 验证码方式 manual（默认）会弹窗手动输入；imap 才通过 XOAUTH2 IMAP 自动收码
-- 成功、失败、当前运行占用的 alias 都会去重
+- 需要离线准备 alias 时，运行 scripts/generate_hotmail_aliases.py
 
 【第三步：并发与稳定性】
 6) 注册数量
@@ -3874,12 +3659,11 @@ class GrokRegisterGUI:
 【最后：快速自检】
 1) 先设置: 注册数量=1，并发线程=1
 2) 点开始后看日志是否出现：
-- 已创建邮箱: xxx@你的域名
-- Cloudflare/CloudMail 本轮邮件数量: ...
+- 已选择邮箱: xxx@hotmail.com
 - 从邮件中提取到验证码: ...
 3) 若第一步就失败：
-- cloudflare 模式: 检查 API Base / CF 路径 / 鉴权模式
-- cloudmail 模式: 检查 URL / 密码 / defaultDomains / 注册接口是否可用
+- 检查 email_provider 是否为 hotmail/outlookmail
+- 检查 mail_credentials.txt 格式、主邮箱凭据和追踪文件
 
 提示:
 - 点“开始注册”会自动保存当前配置到 config.json。
@@ -3991,7 +3775,7 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
-        config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
+        config["email_provider"] = self.email_provider_var.get().strip() or "hotmail"
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
@@ -4075,15 +3859,9 @@ class GrokRegisterGUI:
         for mail_try in range(1, max_mail_retry + 1):
             logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
             open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
-            logf("[*] 2. 创建邮箱并提交")
+            logf("[*] 2. 选择已有邮箱并提交")
             email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
             logf(f"[*] 邮箱: {email}")
-            if get_email_provider() not in ("hotmail", "outlook", "outlookmail", "microsoft"):
-                try:
-                    with open(os.path.join(os.path.dirname(__file__), "created_mailboxes.txt"), "a", encoding="utf-8") as f:
-                        f.write(f"{email}\t{dev_token}\n")
-                except Exception:
-                    pass
             logf("[*] 3. 获取验证码")
             try:
                 code = fill_code_and_submit(

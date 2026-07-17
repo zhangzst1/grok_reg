@@ -44,8 +44,7 @@
 {
   "email_provider": "hotmail",
   "hotmail_accounts_file": "mail_credentials.txt",
-  "hotmail_code_mode": "manual",
-  "hotmail_max_aliases_per_account": 5
+  "hotmail_code_mode": "manual"
 }
 ```
 
@@ -76,16 +75,25 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 
 运行时行为摘要：
 
-- 默认先用原邮箱，后续用随机 plus alias（如 `name+k8s2p9qa@domain`）
+- 运行时只读取并选择 `mail_credentials.txt` 中尚未使用的主邮箱，不创建临时邮箱，也不生成 plus alias
+- `email_provider` 运行时仅支持 `hotmail` / `outlookmail`；DuckMail、YYDS、Cloudflare、CloudMail 会直接提示“邮箱自动生成已禁用”
 - `hotmail_code_mode=manual`（默认）：CLI 在终端提示输入验证码，GUI 弹出输入框；支持 `ABC-123` 或 `ABC123`
 - CLI 多线程会串行显示输入提示；GUI 多线程会逐个显示验证码窗口，提示中包含目标邮箱
 - `hotmail_code_mode=imap`：经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP 自动拉验证码
 - `hotmail_code_mode=api`：调用 `utils/verification_code.py` 中的外部 API 等待邮件并提取验证码；使用该文件内置的 API Key、超时重试和代理故障直连逻辑
 - `mail_retry_count=0`：邮箱阶段只尝试一次，并关闭 Hotmail API 内部的 HTTP 失败重试
-- `mail_retry_count=1`：只尝试当前邮箱、不换邮箱，但 Hotmail API 仍按默认策略重试临时 HTTP 错误；`2` 表示最多尝试两个邮箱
+- `mail_retry_count=1`：只尝试当前邮箱、不换邮箱，但 Hotmail API 仍按默认策略重试临时 HTTP 错误；`2` 表示最多尝试两个已有主邮箱
 - `mail_timeout` 在 Hotmail API 模式会自动限制到外部接口允许的 `1–120` 秒
 - 仅 IMAP 模式会刷新 Microsoft access token；refresh_token 若轮换会**自动回写** `mail_credentials.txt`
-- 成功 / 失败 / 占用中的 alias 会参与去重与 `hotmail_max_aliases_per_account` 计数
+- 主邮箱成功或失败后会写入现有追踪文件，后续运行自动跳过
+
+需要预先批量准备 alias 时，使用离线脚本（不会调用邮箱服务）：
+
+```bash
+uv run python scripts/generate_hotmail_aliases.py --output generated_aliases.txt
+```
+
+脚本默认从 `mail_credentials.txt` 读取每个主邮箱，并为每个主邮箱生成 4 个 8 位随机 alias；输出按轮次交错排列，例如 `邮箱1_第1个、邮箱2_第1个、邮箱3_第1个、邮箱1_第2个……`。每行保留原主邮箱对应的凭据，格式为 `生成邮箱----password----clientId----refresh_token`。可用 `--input`、`--count`、`--length` 覆盖默认值。
 
 相关配置见 `config.example.json` 中 `hotmail_*` 注释键。
 
@@ -143,7 +151,7 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 ## 整链示意
 
 ```
-[邮箱 Hotmail/Outlook 或 CloudMail 等]
+[邮箱 Hotmail/Outlook 主邮箱]
        ↓  注册 accounts.x.ai
  accounts_*.txt / accounts_cli.txt    email----password----sso
        ↓
