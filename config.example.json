@@ -24,7 +24,7 @@
 
   "// hotmail_accounts_file": "Hotmail/Outlook 凭证文件，相对本目录；每行: 邮箱----密码----ClientID----Token，其中 Token 为 Microsoft refresh_token。",
   "hotmail_accounts_file": "mail_credentials.txt",
-  "// hotmail_code_mode": "验证码获取方式：manual=CLI/GUI 手动输入（默认）；imap=使用 Microsoft OAuth2 XOAUTH2 IMAP 自动收码；api=使用 utils/verification_code.py 的外部 API 自动收码。",
+  "// hotmail_code_mode": "验证码获取方式：manual=在当前注册浏览器的验证码页面手动输入（默认）；imap=使用 Microsoft OAuth2 XOAUTH2 IMAP 自动收码；api=使用 utils/verification_code.py 的外部 API 自动收码。",
   "hotmail_code_mode": "manual",
   "// hotmail_poll_interval": "Hotmail/Outlook IMAP 收验证码轮询间隔（秒）。",
   "hotmail_poll_interval": 5,

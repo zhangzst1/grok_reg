@@ -6,7 +6,7 @@ Grok 注册机 - TTK GUI 版本
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, simpledialog
+from tkinter import ttk, messagebox, scrolledtext
 import threading
 import datetime
 import time
@@ -19,6 +19,7 @@ import random
 import re
 import string
 import json
+from typing import Any, Callable
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
@@ -64,6 +65,7 @@ DEFAULT_CONFIG = {
     "hotmail_imap_hosts": "outlook.office365.com,imap-mail.outlook.com",
     "hotmail_imap_last_n": 30,
     "hotmail_require_recipient_match": True,
+    "email_submit_confirm_timeout": 30,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -80,6 +82,8 @@ _hotmail_reserved_aliases = set()
 _hotmail_token_map = {}
 _hotmail_refresh_locks = {}
 _hotmail_refresh_locks_lock = threading.Lock()
+_rejected_email_domains = set()
+_rejected_email_domains_lock = threading.Lock()
 
 
 
@@ -87,7 +91,43 @@ _hotmail_refresh_locks_lock = threading.Lock()
 
 _EMAILS_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_used.txt")
 _EMAILS_ERROR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_error.txt")
+_REJECTED_DOMAINS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "rejected_domains.txt"
+)
 _email_track_lock = threading.Lock()
+
+
+class EmailRejectedError(RuntimeError):
+    """Raised when the signup page explicitly rejects an email domain."""
+
+    def __init__(self, email: str, *, persisted: bool = False):
+        self.email = str(email or "").strip()
+        self.persisted = persisted
+        domain = _email_domain(self.email)
+        detail = f"（域名: {domain}）" if domain else ""
+        super().__init__(f"邮箱已被拒绝{detail}: {self.email}")
+
+
+def _email_domain(email: str) -> str:
+    """Return a normalized domain from an email address."""
+    value = str(email or "").strip().lower()
+    if "@" not in value:
+        return ""
+    return value.rsplit("@", 1)[1].strip()
+
+
+def get_rejected_email_domains() -> set[str]:
+    """Return persisted and in-memory domains rejected by the signup page."""
+    with _rejected_email_domains_lock:
+        domains = set(_rejected_email_domains)
+        if os.path.exists(_REJECTED_DOMAINS_FILE):
+            with open(_REJECTED_DOMAINS_FILE, encoding="utf-8") as f:
+                for line in f:
+                    domain = line.strip().lower()
+                    if domain and not domain.startswith("#") and "@" not in domain:
+                        domains.add(domain)
+        _rejected_email_domains.update(domains)
+        return domains
 
 
 def mark_used(email: str, password: str = ""):
@@ -106,6 +146,30 @@ def mark_error(email: str, password: str = "", reason: str = ""):
     with _email_track_lock:
         with open(_EMAILS_ERROR_FILE, "a", encoding="utf-8") as f:
             f.write(f"{email}----{password}----{reason}\n")
+    try:
+        _hotmail_release_alias(email)
+    except Exception:
+        pass
+
+
+def mark_rejected_domain(email: str) -> None:
+    """Persist only the domain from an email rejected by the signup page."""
+    domain = _email_domain(email)
+    if not domain:
+        raise ValueError(f"无法从邮箱中提取被拒绝域名: {email}")
+    with _rejected_email_domains_lock:
+        existing = set(_rejected_email_domains)
+        if os.path.exists(_REJECTED_DOMAINS_FILE):
+            with open(_REJECTED_DOMAINS_FILE, encoding="utf-8") as f:
+                existing.update(
+                    line.strip().lower()
+                    for line in f
+                    if line.strip() and not line.lstrip().startswith("#")
+                )
+        if domain not in existing:
+            with open(_REJECTED_DOMAINS_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{domain}\n")
+        _rejected_email_domains.add(domain)
     try:
         _hotmail_release_alias(email)
     except Exception:
@@ -697,6 +761,360 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         time.sleep(min(0.2, remaining))
 
 
+# 操作系统只有一个真实鼠标；多线程/多窗口时必须串行点击
+_real_mouse_lock = threading.Lock()
+# 多线程错开窗口位置用（worker_id -> 是否已 layout）
+_window_layout_lock = threading.Lock()
+_window_layout_index = 0
+
+
+def _browser_pid(page) -> int | None:
+    try:
+        pid = getattr(page.browser, "process_id", None)
+        return int(pid) if pid else None
+    except Exception:
+        return None
+
+
+def _find_hwnds_for_browser(page):
+    """按浏览器 PID + 标签标题枚举顶层 HWND（不依赖 pywin32）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    pid = _browser_pid(page)
+    title = ""
+    try:
+        title = str(page.title or "")
+    except Exception:
+        title = ""
+
+    if not pid:
+        return []
+
+    hwnds: list[int] = []
+    target_pid = int(pid)
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        # 无父窗口的顶层窗
+        if user32.GetParent(hwnd):
+            return True
+        proc_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+        if int(proc_id.value) != target_pid:
+            return True
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        text = buf.value or ""
+        # 标题匹配优先；匹配不到时仍收集该 PID 的可见顶层窗
+        if title and title in text:
+            hwnds.insert(0, int(hwnd))
+        else:
+            hwnds.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    # 去重保序
+    seen = set()
+    ordered = []
+    for h in hwnds:
+        if h not in seen:
+            seen.add(h)
+            ordered.append(h)
+    return ordered
+
+
+def _hwnd_pid(hwnd: int) -> int | None:
+    import ctypes
+    from ctypes import wintypes
+
+    if not hwnd:
+        return None
+    user32 = ctypes.windll.user32
+    proc_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(proc_id))
+    try:
+        return int(proc_id.value) or None
+    except Exception:
+        return None
+
+
+def _top_level_hwnd(hwnd: int) -> int:
+    """从子控件 HWND 向上找到顶层窗口。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    GA_ROOT = 2
+    try:
+        root = user32.GetAncestor(int(hwnd), GA_ROOT)
+        return int(root or hwnd)
+    except Exception:
+        return int(hwnd)
+
+
+def _point_hits_browser(page, x: int, y: int) -> bool:
+    """检查屏幕坐标 (x,y) 最上层窗口是否属于目标浏览器进程。"""
+    if sys.platform != "win32" or page is None:
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    pid = _browser_pid(page)
+    if not pid:
+        return False
+    user32 = ctypes.windll.user32
+    pt = wintypes.POINT(int(x), int(y))
+    hwnd = user32.WindowFromPoint(pt)
+    if not hwnd:
+        return False
+    # 控件 HWND → 顶层窗 → PID
+    hit_pid = _hwnd_pid(hwnd) or _hwnd_pid(_top_level_hwnd(hwnd))
+    return hit_pid == pid
+
+
+def _force_window_topmost(hwnd: int, enable: bool = True) -> None:
+    """临时 HWND_TOPMOST，解决重叠窗口时 SetForegroundWindow 不够用的情况。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_SHOWWINDOW = 0x0040
+    SWP_NOACTIVATE = 0x0010
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    if not enable:
+        flags |= SWP_NOACTIVATE
+    insert_after = HWND_TOPMOST if enable else HWND_NOTOPMOST
+    user32.SetWindowPos(int(hwnd), insert_after, 0, 0, 0, 0, flags)
+
+
+def activate_browser_window(page, log_callback=None, *, topmost: bool = True) -> int | None:
+    """把目标标签/浏览器窗口置前，供真实鼠标点击使用。
+
+    多窗口重叠时：仅 SetForegroundWindow 往往不够，会临时 TOPMOST。
+    返回目标顶层 HWND；失败返回 None。
+    """
+    if page is None:
+        return None
+
+    # 1) 切到正确标签（同浏览器多 tab）
+    try:
+        page.set.activate()
+    except Exception:
+        pass
+
+    # 2) 恢复窗口状态
+    try:
+        page.set.window.show()
+    except Exception:
+        pass
+    try:
+        state = ""
+        try:
+            state = str(page.rect.window_state or "")
+        except Exception:
+            state = ""
+        if state in ("minimized", "Minimized"):
+            page.set.window.normal()
+    except Exception:
+        pass
+
+    if sys.platform != "win32":
+        return 1  # 非 Windows 无 HWND，返回真值表示“已尽力”
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
+    SW_SHOW = 5
+
+    hwnds = _find_hwnds_for_browser(page)
+    if not hwnds:
+        if log_callback:
+            log_callback("[Debug] 未找到浏览器 HWND，跳过 Win32 置前")
+        return None
+
+    hwnd = int(hwnds[0])
+    try:
+        # 允许跨线程前台切换
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None)
+        cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_tid and fg_tid != cur_tid:
+            user32.AttachThreadInput(cur_tid, fg_tid, True)
+            attached = True
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        else:
+            user32.ShowWindow(hwnd, SW_SHOW)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetActiveWindow(hwnd)
+        # 重叠窗口关键：短暂 TOPMOST，确保盖住其它 Chrome
+        if topmost:
+            _force_window_topmost(hwnd, True)
+            user32.SetForegroundWindow(hwnd)
+        if attached:
+            user32.AttachThreadInput(cur_tid, fg_tid, False)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Win32 置前失败: {exc}")
+        return None
+
+    time.sleep(0.15)
+    if log_callback:
+        log_callback(f"[*] 已激活浏览器窗口 hwnd={hwnd}")
+    return hwnd
+
+
+def layout_browser_window(page, slot: int | None = None, total: int | None = None, log_callback=None) -> bool:
+    """把浏览器窗口平铺/错开，避免多线程窗口完全重叠导致点不到。
+
+    slot: 0-based 槽位；None 时自动递增分配。
+    total: 并发窗口数，用于计算网格；None 时按 config.register_threads。
+    """
+    if page is None:
+        return False
+    global _window_layout_index
+    try:
+        if total is None:
+            total = max(1, int(config.get("register_threads", 1) or 1))
+        total = max(1, int(total))
+        if slot is None:
+            with _window_layout_lock:
+                slot = _window_layout_index
+                _window_layout_index += 1
+        slot = max(0, int(slot)) % total
+
+        # 工作区尺寸（排除任务栏）
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            user32 = ctypes.windll.user32
+            SPI_GETWORKAREA = 0x0030
+            rc = RECT()
+            if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rc), 0):
+                work_l, work_t = int(rc.left), int(rc.top)
+                work_w = max(800, int(rc.right - rc.left))
+                work_h = max(600, int(rc.bottom - rc.top))
+            else:
+                work_l, work_t, work_w, work_h = 0, 0, 1600, 900
+        else:
+            work_l, work_t, work_w, work_h = 0, 0, 1600, 900
+
+        # 网格：优先横排，窗口数多时 2 行
+        cols = min(total, 3) if total <= 3 else min(total, max(2, int(total ** 0.5 + 0.999)))
+        rows = (total + cols - 1) // cols
+        col = slot % cols
+        row = slot // cols
+        # 预留边距，避免贴边
+        margin = 8
+        cell_w = max(480, (work_w - margin * (cols + 1)) // cols)
+        cell_h = max(420, (work_h - margin * (rows + 1)) // rows)
+        x = work_l + margin + col * (cell_w + margin)
+        y = work_t + margin + row * (cell_h + margin)
+
+        try:
+            page.set.window.normal()
+        except Exception:
+            pass
+        try:
+            page.set.window.size(cell_w, cell_h)
+        except Exception:
+            pass
+        try:
+            page.set.window.location(x, y)
+        except Exception:
+            pass
+
+        if log_callback:
+            log_callback(f"[*] 窗口布局 slot={slot}/{total} pos=({x},{y}) size=({cell_w}x{cell_h})")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 窗口布局失败: {exc}")
+        return False
+
+
+def _os_left_click_at(sx: int, sy: int) -> None:
+    """在已持锁、已置前的前提下，发送一次左键点击。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    if not user32.SetCursorPos(int(sx), int(sy)):
+        raise OSError(f"SetCursorPos({sx}, {sy}) failed")
+    time.sleep(0.04)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    time.sleep(0.04)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+
+def real_mouse_click_screen(x, y, log_callback=None, page=None):
+    """用操作系统级鼠标事件在屏幕绝对坐标 (x, y) 执行真实左键点击。
+
+    用于 Turnstile 等跨域 iframe 内控件：JS click / CDP 点击常被拦截，
+    屏幕坐标的物理点击更接近真人操作。仅支持 Windows。
+
+    多窗口/多线程：
+      - 若传入 page，会先 activate（含 TOPMOST）并校验点位命中目标窗
+      - 全程持有全局锁，避免两个线程同时抢真实鼠标
+    """
+    try:
+        sx = int(round(float(x)))
+        sy = int(round(float(y)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid screen point: {(x, y)!r}") from exc
+
+    if sys.platform != "win32":
+        raise RuntimeError(f"real_mouse_click_screen only supports Windows, got {sys.platform}")
+
+    with _real_mouse_lock:
+        hwnd = None
+        try:
+            if page is not None:
+                hwnd = activate_browser_window(page, log_callback=log_callback, topmost=True)
+                if not _point_hits_browser(page, sx, sy):
+                    # 仍被挡住：再强制一次 TOPMOST 后重试命中检测
+                    if hwnd:
+                        _force_window_topmost(int(hwnd), True)
+                        time.sleep(0.1)
+                    if not _point_hits_browser(page, sx, sy):
+                        raise RuntimeError(
+                            f"屏幕点 ({sx},{sy}) 仍被其它窗口遮挡，无法安全点击目标浏览器"
+                        )
+            _os_left_click_at(sx, sy)
+            if log_callback:
+                log_callback(f"[*] 真实鼠标点击屏幕坐标: ({sx}, {sy})")
+            return sx, sy
+        finally:
+            # 取消 TOPMOST，避免窗口一直钉在最前干扰其它线程
+            if hwnd and hwnd != 1:
+                try:
+                    _force_window_topmost(int(hwnd), False)
+                except Exception:
+                    pass
+
+
 def human_sleep(mean_seconds, cancel_callback=None):
     """高斯分布人类化延迟，sigma=mean*0.3，clamp [mean*0.5, mean*2.0]。
 
@@ -982,15 +1400,25 @@ def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
         raise Exception("YYDS 没有返回可用域名")
+    rejected_domains = get_rejected_email_domains()
+    domains = [
+        item
+        for item in domains
+        if str(item.get("domain") or "").strip().lower() not in rejected_domains
+    ]
+    if not domains:
+        raise Exception("YYDS 可用域名均已被注册页面拒绝")
+    # Prefer private verified domains, then public verified, then any verified.
+    # Within each tier, pick randomly so concurrent registrations spread out.
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
     if private:
-        return private[0]["domain"]
+        return random.choice(private)["domain"]
     public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
     if public:
-        return public[0]["domain"]
+        return random.choice(public)["domain"]
     verified = [d for d in domains if d.get("isVerified")]
     if verified:
-        return verified[0]["domain"]
+        return random.choice(verified)["domain"]
     raise Exception("YYDS 没有已验证的可用域名")
 
 
@@ -1000,6 +1428,7 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     if not token and not key:
         raise Exception("YYDS API Key 或 JWT 未配置")
     domain = yyds_pick_domain(api_key=key, jwt=token)
+    print(f"domain: {domain}")
     username = yyds_generate_username(10)
     result = yyds_create_account(
         local_part=username, domain=domain, api_key=key, jwt=token
@@ -1431,10 +1860,13 @@ def _hotmail_alias_available(alias_email):
 
 def hotmail_get_email_and_token():
     accounts = _hotmail_load_accounts()
+    rejected_domains = get_rejected_email_domains()
     with _hotmail_selection_lock:
         for acc in accounts:
             main_email = acc["email"].strip()
             if "@" not in main_email:
+                continue
+            if _email_domain(main_email) in rejected_domains:
                 continue
             if not _hotmail_alias_available(main_email):
                 continue
@@ -1781,6 +2213,16 @@ def should_retry_verification_error(message):
     return "已取消" not in text and ("未收到验证码" in text or "验证码" in text)
 
 
+def is_email_rejected_error(message) -> bool:
+    """Return whether an error represents the signup page's rejection message."""
+    return "已被拒绝" in str(message or "")
+
+
+def should_retry_email_error(message) -> bool:
+    """Retry either an explicit email rejection or a verification mailbox failure."""
+    return is_email_rejected_error(message) or should_retry_verification_error(message)
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider in ("hotmail", "outlook", "outlookmail", "microsoft"):
@@ -1805,19 +2247,12 @@ def get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
-    manual_code_callback=None,
 ):
     provider = get_email_provider()
     if provider in ("hotmail", "outlook", "outlookmail", "microsoft"):
         mode = str(config.get("hotmail_code_mode", "manual") or "manual").strip().lower()
         if mode == "manual":
-            if manual_code_callback is None:
-                raise RuntimeError("Hotmail 手动验证码模式缺少输入通道")
-            raise_if_cancelled(cancel_callback)
-            code = manual_code_callback(email)
-            if code is None or not str(code).strip():
-                raise RuntimeError("手动验证码输入已取消")
-            return normalize_manual_verification_code(code)
+            raise RuntimeError("Hotmail manual 模式应在浏览器验证码页面中输入")
         if mode == "api":
             raise_if_cancelled(cancel_callback)
             try:
@@ -2189,12 +2624,24 @@ def _set_page(value):
     pass  # TabPool 管理 tab，外部 setter 为 no-op
 
 
-def start_browser(log_callback=None):
+def start_browser(log_callback=None, layout_slot: int | None = None, layout_total: int | None = None):
     last_exc = None
     for attempt in range(1, 5):
         try:
             TabPool.init(create_browser_options, log_callback=log_callback)
             page = TabPool.get_tab()
+            # 多线程时错开窗口，避免完全重叠导致真实鼠标点不到下层窗
+            try:
+                threads = max(1, int(config.get("register_threads", 1) or 1))
+            except Exception:
+                threads = 1
+            if threads > 1 or layout_slot is not None:
+                layout_browser_window(
+                    page,
+                    slot=layout_slot,
+                    total=layout_total if layout_total is not None else threads,
+                    log_callback=log_callback,
+                )
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return TabPool.get_browser(), page
@@ -2361,15 +2808,74 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
-def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
+def wait_for_email_submit_result(
+    page: Any,
+    timeout: float = 30,
+    log_callback: Callable[[str], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
+) -> str:
+    """Wait for email rejection or advancement to the verification/profile step."""
+    deadline = time.time() + max(0.5, float(timeout))
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            state = str(
+                page.run_js(
+                    r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const bodyText = String(document.body?.innerText || '').replace(/\s+/g, '');
+if (bodyText.includes('已被拒绝')) return 'rejected';
+
+const verificationInput = Array.from(document.querySelectorAll(
+    'input[data-input-otp="true"], input[name="code"], input[name*="otp" i], input[name*="verification" i], input[autocomplete="one-time-code"], input[maxlength="1"]'
+)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (verificationInput) return 'advanced';
+
+const profileInput = Array.from(document.querySelectorAll(
+    'input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[type="password"], input[autocomplete="new-password"]'
+)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (profileInput) return 'advanced';
+
+const lowerText = bodyText.toLowerCase();
+if (
+    bodyText.includes('验证码') ||
+    bodyText.includes('确认邮箱') ||
+    lowerText.includes('verificationcode') ||
+    lowerText.includes('verifyyouremail') ||
+    lowerText.includes('checkyouremail') ||
+    lowerText.includes('confirmyouremail')
+) return 'advanced';
+
+return 'pending';
+                    """
+                )
+            )
+        except Exception as exc:
+            state = "pending"
+            if log_callback:
+                log_callback(f"[Debug] 检查邮箱提交结果失败: {exc}")
+        if state in {"rejected", "advanced"}:
+            return state
+        human_sleep(0.25, cancel_callback)
+    return "timeout"
+
+
+def _fill_email_and_submit_once(timeout=15, log_callback=None, cancel_callback=None):
     page = _get_page()
     raise_if_cancelled(cancel_callback)
     check_timeout(time.time())
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
-        raise Exception("鑾峰彇閭澶辫触")
+        raise Exception("获取邮箱失败")
     if log_callback:
-        log_callback(f"[*] 宸插垱寤洪偖绠? {email}")
+        log_callback(f"[*] 已获取邮箱: {email}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2457,9 +2963,191 @@ return true;
                 log_callback(f"[*] 已填写邮箱并点击注册: {email}")
             dump_state(page, "email-submitted")
             take_screenshot(page, "email-submitted")
+            try:
+                confirm_timeout = float(
+                    config.get("email_submit_confirm_timeout", 30) or 30
+                )
+            except (TypeError, ValueError):
+                confirm_timeout = 30
+            submit_state = wait_for_email_submit_result(
+                page,
+                timeout=confirm_timeout,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            if submit_state == "rejected":
+                persisted = False
+                try:
+                    mark_rejected_domain(email)
+                    persisted = True
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 保存被拒绝邮箱失败: {exc}")
+                raise EmailRejectedError(email, persisted=persisted)
+            if submit_state == "timeout" and log_callback:
+                log_callback("[Debug] 未确认邮箱提交后的页面状态，继续验证码流程")
             return email, dev_token
         human_sleep(0.5, cancel_callback)
     raise Exception("未找到邮箱输入框或注册按钮")
+
+
+def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
+    """Submit an email, automatically replacing it when its domain is rejected."""
+    max_attempts = max(2, get_mail_attempt_count())
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _fill_email_and_submit_once(
+                timeout=timeout,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+        except EmailRejectedError:
+            if attempt >= max_attempts:
+                raise
+            if log_callback:
+                log_callback(
+                    f"[*] 邮箱域名被拒绝，正在重新获取邮箱 "
+                    f"({attempt + 1}/{max_attempts})"
+                )
+            open_signup_page(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+    raise RuntimeError("邮箱域名连续被拒绝，无法获取可用邮箱")
+
+
+def wait_for_manual_code_in_browser(
+    page: Any,
+    email: str,
+    timeout: float = 180,
+    log_callback: Callable[[str], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
+) -> tuple[str | None, bool]:
+    """Wait until the user enters the Hotmail code in the browser page."""
+    if log_callback:
+        log_callback(
+            f"[*] 请在浏览器中输入 {email} 收到的验证码；输入完整后将自动继续"
+        )
+
+    session_id = secrets.token_hex(8)
+    deadline = time.time() + max(1, float(timeout))
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        state = str(
+            page.run_js(
+                r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const sessionId = String(arguments[0] || '');
+if (window.__grokManualCodeSession !== sessionId) {
+    window.__grokManualCodeSession = sessionId;
+    window.__grokManualVerificationCode = '';
+    window.__grokManualCodeFocused = false;
+}
+
+function cleanCode(value) {
+    return String(value || '').replace(/[^a-z0-9]/gi, '').slice(0, 6);
+}
+
+function readCurrentCode() {
+    const aggregate = Array.from(document.querySelectorAll(
+      'input[data-input-otp="true"], input[name="code"], input[name*="otp" i], input[name*="verification" i], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]'
+    )).find((node) => isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 6) !== 1);
+    if (aggregate) return cleanCode(aggregate.value);
+
+    const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
+        if (!isVisible(node) || node.disabled || node.readOnly) return false;
+        const maxLength = Number(node.maxLength || 0);
+        const ac = String(node.autocomplete || '').toLowerCase();
+        const name = String(node.name || '').toLowerCase();
+        return maxLength === 1 || ac === 'one-time-code' || name.includes('otp');
+    });
+    if (otpBoxes.length >= 6) {
+        return cleanCode(otpBoxes.slice(0, 6).map((node) => node.value || '').join(''));
+    }
+    return '';
+}
+
+function rememberCode() {
+    const code = readCurrentCode();
+    if (code.length === 6) window.__grokManualVerificationCode = code;
+}
+
+const codeInputs = Array.from(document.querySelectorAll(
+  'input[data-input-otp="true"], input[name="code"], input[name*="otp" i], input[name*="verification" i], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"], input[maxlength="1"]'
+)).filter((node) => isVisible(node) && !node.disabled && !node.readOnly);
+
+for (const input of codeInputs) {
+    if (input.dataset.grokManualCodeWatcher === '1') continue;
+    input.dataset.grokManualCodeWatcher = '1';
+    input.addEventListener('input', rememberCode, true);
+    input.addEventListener('change', rememberCode, true);
+}
+
+if (codeInputs.length && !window.__grokManualCodeFocused) {
+    window.__grokManualCodeFocused = true;
+    codeInputs[0].focus();
+    codeInputs[0].click();
+}
+
+rememberCode();
+const remembered = cleanCode(window.__grokManualVerificationCode || '');
+
+// Profile form means the browser already accepted the code and advanced.
+// Check this before returning a remembered code, otherwise we re-fill OTP
+// after the page has left the verification step and never reach fill_profile.
+const profileReady = Array.from(document.querySelectorAll(
+  'input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[type="password"], input[autocomplete="new-password"]'
+)).some((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (profileReady) return 'submitted:';
+
+// Only hand the code back for programmatic re-fill/submit while OTP inputs
+// are still on screen. If the code was typed and inputs already vanished
+// (transition), keep waiting instead of forcing a failed re-fill.
+if (remembered.length === 6 && codeInputs.length) return `code:${remembered}`;
+return codeInputs.length ? 'waiting:' : 'not-ready:';
+                """,
+                session_id,
+            )
+            or ""
+        )
+        if state.startswith("code:"):
+            code = normalize_manual_verification_code(state.split(":", 1)[1])
+            return code, False
+        if state == "submitted:":
+            return None, True
+        human_sleep(0.2, cancel_callback)
+
+    raise RuntimeError(f"等待在浏览器输入 Hotmail 验证码超时: {email}")
+
+
+def _page_has_visible_profile_form(page: Any) -> bool:
+    """Return True when the signup profile/password form is visible."""
+    try:
+        return bool(
+            page.run_js(
+                r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+return Array.from(document.querySelectorAll(
+  'input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[type="password"], input[autocomplete="new-password"]'
+)).some((node) => isVisible(node) && !node.disabled && !node.readOnly);
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def fill_code_and_submit(
@@ -2468,7 +3156,6 @@ def fill_code_and_submit(
     timeout=180,
     log_callback=None,
     cancel_callback=None,
-    manual_code_callback=None,
 ):
     page = _get_page()
     check_timeout(time.time())
@@ -2496,16 +3183,36 @@ return false;
     except Exception:
         mail_poll_interval = 3
 
-    code = get_oai_code(
-        dev_token,
-        email,
-        timeout=mail_timeout,
-        poll_interval=mail_poll_interval,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-        resend_callback=_resend_code,
-        manual_code_callback=manual_code_callback,
+    provider = get_email_provider()
+    hotmail_mode = str(
+        config.get("hotmail_code_mode", "manual") or "manual"
+    ).strip().lower()
+    browser_manual_mode = (
+        provider in ("hotmail", "outlook", "outlookmail", "microsoft")
+        and hotmail_mode == "manual"
     )
+    if browser_manual_mode:
+        code, already_submitted = wait_for_manual_code_in_browser(
+            page,
+            email,
+            timeout=mail_timeout,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+        if already_submitted:
+            if log_callback:
+                log_callback("[*] 验证码已在浏览器中输入并提交")
+            return "已在浏览器提交"
+    else:
+        code = get_oai_code(
+            dev_token,
+            email,
+            timeout=mail_timeout,
+            poll_interval=mail_poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=_resend_code,
+        )
     if not code:
         raise Exception("获取验证码失败")
     clean_code = str(code).replace("-", "").strip()
@@ -2575,11 +3282,21 @@ return 'not-ready';
         )
 
         if filled == "not-ready":
+            # Manual browser entry can race: code was captured, then the page
+            # advanced to the profile form before re-fill ran. Only in this mode.
+            if browser_manual_mode and _page_has_visible_profile_form(page):
+                if log_callback:
+                    log_callback("[*] 验证码已在浏览器中输入并提交")
+                return "已在浏览器提交"
             human_sleep(0.5, cancel_callback)
             continue
         if "failed" in str(filled):
             if log_callback:
                 log_callback(f"[Debug] 验证码填写失败: {filled}")
+            if browser_manual_mode and _page_has_visible_profile_form(page):
+                if log_callback:
+                    log_callback("[*] 验证码已在浏览器中输入并提交")
+                return "已在浏览器提交"
             human_sleep(0.5, cancel_callback)
             continue
 
@@ -2627,18 +3344,25 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
-def getTurnstileToken(log_callback=None, cancel_callback=None):
+def getTurnstileToken(log_callback=None, cancel_callback=None, *, reset: bool = False):
+    """等待/触发页面 Turnstile，返回 response token。
+
+    reset=True 时会调用 turnstile.reset()，会清空当前进度并刷新验证码；
+    注册页等待中默认不要 reset，否则刚点过的 checkbox 会被刷掉。
+    """
     page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
+    if reset:
+        try:
+            page.run_js(
+                "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+            )
+        except Exception:
+            pass
 
+    clicked_once = False
     for _ in range(0, 20):
         raise_if_cancelled(cancel_callback)
         try:
@@ -2659,6 +3383,11 @@ try {
                 if log_callback:
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
+
+            # 已点过则只轮询，避免反复 click 触发 Turnstile 刷新
+            if clicked_once:
+                human_sleep(1, cancel_callback)
+                continue
 
             challenge_input = page.ele("@name=cf-turnstile-response")
             if challenge_input:
@@ -2687,6 +3416,7 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
                         btn = body_sr.ele("tag:input")
                         if btn:
                             btn.click()
+                            clicked_once = True
                     except Exception:
                         pass
             else:
@@ -2700,11 +3430,64 @@ const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n
 if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                     """
                 )
+                clicked_once = True
         except Exception:
             pass
         human_sleep(1, cancel_callback)
 
     raise Exception("Turnstile 获取 token 失败")
+
+
+def _click_turnstile_checkbox_once(page, log_callback=None):
+    """对 Turnstile shadow checkbox 做一次屏幕坐标真实点击。成功返回 True。
+
+    重叠窗口策略（全局鼠标锁内）：
+      1) 目标窗 TOPMOST 置前
+      2) 再取 screen_midpoint（置前后坐标更准）
+      3) WindowFromPoint 确认该像素属于目标浏览器 PID
+      4) 才发 OS 左键；结束后取消 TOPMOST
+    """
+    hwnd = None
+    try:
+        with _real_mouse_lock:
+            hwnd = activate_browser_window(page, log_callback=log_callback, topmost=True)
+            ele = page.ele('@name=cf-turnstile-response', timeout=2)
+            if ele is None:
+                return False
+            parent = ele.parent().sr('t:iframe').ele('tag=body').sr.ele('@type=checkbox')
+            mid = parent.rect.screen_midpoint
+            sx = int(round(float(mid[0])))
+            sy = int(round(float(mid[1])))
+            if log_callback:
+                log_callback(f"[*] 定位 Turnstile checkbox，screen_midpoint=({sx}, {sy})")
+
+            if not _point_hits_browser(page, sx, sy):
+                if hwnd and hwnd != 1:
+                    _force_window_topmost(int(hwnd), True)
+                    time.sleep(0.12)
+                # 置顶后坐标可能微移，重取
+                mid = parent.rect.screen_midpoint
+                sx = int(round(float(mid[0])))
+                sy = int(round(float(mid[1])))
+                if not _point_hits_browser(page, sx, sy):
+                    raise RuntimeError(
+                        f"Turnstile 点 ({sx},{sy}) 被其它窗口遮挡（多窗口重叠）"
+                    )
+
+            _os_left_click_at(sx, sy)
+            if log_callback:
+                log_callback(f"[*] 真实鼠标点击屏幕坐标: ({sx}, {sy})")
+        return True
+    except Exception as cf_exc:
+        if log_callback:
+            log_callback(f"[Debug] Turnstile checkbox 真实点击失败: {cf_exc}")
+        return False
+    finally:
+        if hwnd and hwnd != 1:
+            try:
+                _force_window_topmost(int(hwnd), False)
+            except Exception:
+                pass
 
 
 def build_profile():
@@ -2745,7 +3528,73 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     deadline = time.time() + timeout
     form_filled_once = False
     wait_cf_since = None
+    last_cf_click_at = 0.0
     last_cf_retry_at = 0.0
+    # 重复真实点击 / turnstile.reset 都会刷新验证码，导致提交按钮一直不可用
+    cf_click_cooldown = 12.0
+    cf_max_clicks = 3
+    cf_click_count = 0
+
+    def _handle_wait_cloudflare(token_len_hint: str = "0", phase: str = "wait") -> None:
+        """等待 Turnstile：最多低频点击几次，其余时间只轮询 token。"""
+        nonlocal wait_cf_since, last_cf_click_at, last_cf_retry_at, cf_click_count
+        now = time.time()
+        if wait_cf_since is None:
+            wait_cf_since = now
+        if log_callback:
+            log_callback(
+                f"[*] 等待 Cloudflare 人机验证通过后再提交... "
+                f"phase={phase} token长度={token_len_hint} "
+                f"clicked={cf_click_count}/{cf_max_clicks}"
+            )
+
+        # 仅在冷却结束后再点；点完后必须给 CF 几秒出 token，不要立刻再点
+        can_click = (
+            cf_click_count < cf_max_clicks
+            and (last_cf_click_at <= 0 or now - last_cf_click_at >= cf_click_cooldown)
+        )
+        if can_click:
+            if _click_turnstile_checkbox_once(page, log_callback=log_callback):
+                cf_click_count += 1
+                last_cf_click_at = time.time()
+                # 点击后多等一会，避免下一轮立刻再点把验证刷掉
+                human_sleep(2.5, cancel_callback)
+                return
+
+        # 长时间仍无 token：不 reset（reset 会刷新验证码），只再尝试一次组件内点击/轮询
+        if now - wait_cf_since >= 20 and now - last_cf_retry_at >= 15:
+            if log_callback:
+                log_callback("[*] 提交前仍卡住，尝试轮询/轻触发 Turnstile（不 reset）...")
+            try:
+                token = getTurnstileToken(
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                    reset=False,
+                )
+                if token:
+                    synced = page.run_js(
+                        """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return false;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+                        """,
+                        token,
+                    )
+                    if log_callback:
+                        log_callback(f"[*] Turnstile 回填完成，长度={synced}")
+            except Exception as cf_exc:
+                if log_callback:
+                    log_callback(f"[Debug] Turnstile 轮询失败: {cf_exc}")
+            last_cf_retry_at = time.time()
+            return
+
+        human_sleep(1.0, cancel_callback)
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2828,40 +3677,8 @@ return 'filled-no-submit';
 
             if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
                 form_filled_once = True
-                if log_callback:
-                    token_len = filled.split(":", 1)[1] if ":" in filled else "0"
-                    log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
-                now = time.time()
-                if wait_cf_since is None:
-                    wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                    if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
-                    try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                        if token:
-                            synced = page.run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                    except Exception as cf_exc:
-                        if log_callback:
-                            log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                    last_cf_retry_at = now
-                human_sleep(0.8, cancel_callback)
+                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
+                _handle_wait_cloudflare(token_len, phase="fill")
                 continue
 
             if filled in ("ready-to-submit", "filled-no-submit"):
@@ -2908,39 +3725,8 @@ return 'submitted';
         )
 
         if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            if log_callback:
-                token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
-                log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
-            now = time.time()
-            if wait_cf_since is None:
-                wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                if log_callback:
-                    log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
-                try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                    if token:
-                        synced = page.run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                except Exception as cf_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                last_cf_retry_at = now
-            human_sleep(0.8, cancel_callback)
+            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
+            _handle_wait_cloudflare(token_len, phase="submit")
             continue
 
         if submit_state == "submitted":
@@ -3470,14 +4256,11 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
-        self.manual_code_requests = queue.Queue()
-        self._manual_code_dialog_active = False
         self.accounts_output_file = ""
         self.stats_lock = threading.Lock()
         self._tutorial_window = None
         self.setup_ui()
         self.root.after(200, self._maybe_show_tutorial_on_start)
-        self.root.after(100, self._process_manual_code_requests)
 
     def setup_ui(self):
         load_config()
@@ -3680,7 +4463,7 @@ class GrokRegisterGUI:
 - Hotmail账号文件默认: mail_credentials.txt
 - 每行格式: your@hotmail.com----mailPassword----client-id----refresh-token
 - 注册运行时只读取并选择主邮箱，不创建临时邮箱，也不生成 plus alias
-- 验证码方式 manual（默认）会弹窗手动输入；imap 才通过 XOAUTH2 IMAP 自动收码
+- 验证码方式 manual（默认）请直接在浏览器验证码页面输入；imap 才通过 XOAUTH2 IMAP 自动收码
 - 需要离线准备 alias 时，运行 scripts/generate_hotmail_aliases.py
 - YYDS 必须勾选“允许 YYDS 创建临时邮箱”并配置 AC- 开头的 API Key
 
@@ -3771,60 +4554,6 @@ class GrokRegisterGUI:
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
-
-    def request_manual_hotmail_code(self, email):
-        """Queue a Hotmail code prompt for Tk's main thread and wait for it."""
-        request = {
-            "email": email,
-            "event": threading.Event(),
-            "code": None,
-            "error": None,
-            "cancelled": False,
-        }
-        self.manual_code_requests.put(request)
-        while not request["event"].wait(0.1):
-            if self.should_stop():
-                request["cancelled"] = True
-                raise RegistrationCancelled("手动验证码输入因任务停止而取消")
-        if request["error"] is not None:
-            raise request["error"]
-        return request["code"]
-
-    def _process_manual_code_requests(self):
-        """Run queued manual-code dialogs on Tk's main thread, one at a time."""
-        if self._manual_code_dialog_active:
-            self.root.after(100, self._process_manual_code_requests)
-            return
-        try:
-            request = self.manual_code_requests.get_nowait()
-        except queue.Empty:
-            self.root.after(100, self._process_manual_code_requests)
-            return
-
-        self._manual_code_dialog_active = True
-        try:
-            if request.get("cancelled") or self.should_stop():
-                request["error"] = RegistrationCancelled("手动验证码输入因任务停止而取消")
-                return
-            email = request.get("email") or "当前 Hotmail 邮箱"
-            while True:
-                raw = simpledialog.askstring(
-                    "输入 Hotmail 验证码",
-                    f"请输入 {email} 收到的验证码：\n\n格式：ABC-123 或 ABC123",
-                    parent=self.root,
-                )
-                if raw is None or not str(raw).strip():
-                    request["error"] = RuntimeError("手动验证码输入已取消")
-                    break
-                try:
-                    request["code"] = normalize_manual_verification_code(raw)
-                    break
-                except ValueError as exc:
-                    messagebox.showerror("验证码格式错误", str(exc), parent=self.root)
-        finally:
-            self._manual_code_dialog_active = False
-            request["event"].set()
-            self.root.after(100, self._process_manual_code_requests)
 
     def start_registration(self):
         if self.is_running:
@@ -3923,31 +4652,44 @@ class GrokRegisterGUI:
         mail_ok = False
         max_mail_retry = get_mail_attempt_count()
         for mail_try in range(1, max_mail_retry + 1):
-            logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-            open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
-            logf("[*] 2. 选择已有邮箱并提交")
-            email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
-            logf(f"[*] 邮箱: {email}")
-            logf("[*] 3. 获取验证码")
             try:
+                email = ""
+                dev_token = ""
+                logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
+                logf("[*] 2. 选择已有邮箱并提交")
+                email, dev_token = fill_email_and_submit(
+                    log_callback=logf,
+                    cancel_callback=self.should_stop,
+                )
+                logf(f"[*] 邮箱: {email}")
+                logf("[*] 3. 获取验证码")
                 code = fill_code_and_submit(
                     email,
                     dev_token,
                     log_callback=logf,
                     cancel_callback=self.should_stop,
-                    manual_code_callback=self.request_manual_hotmail_code,
                 )
                 mail_ok = True
                 break
             except Exception as mail_exc:
                 msg = str(mail_exc)
-                if email:
+                failed_email = str(
+                    getattr(mail_exc, "email", "") or email or ""
+                ).strip()
+                if failed_email:
+                    email = failed_email
+                already_persisted = bool(getattr(mail_exc, "persisted", False))
+                if email and not already_persisted:
                     try:
                         mark_error(email, reason=msg[:120])
                     except Exception:
                         pass
-                if should_retry_verification_error(msg) and mail_try < max_mail_retry:
-                    logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                if should_retry_email_error(msg) and mail_try < max_mail_retry:
+                    if is_email_rejected_error(msg):
+                        logf(f"[!] 邮箱域名已被拒绝，自动更换其他域名邮箱重试: {msg}")
+                    else:
+                        logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
                     continue
@@ -3999,17 +4741,35 @@ class GrokRegisterGUI:
         )
         result_record["cpa"] = cpa_result
 
-    def _worker_loop(self, worker_id, total, task_queue):
+    def _worker_loop(self, worker_id, total, task_queue, worker_count=1):
         prefix = f"[T{worker_id}]"
         logf = lambda m: self.log(f"{prefix} {m}")
+        # worker_id 为 1-based；布局槽位 0-based，保证多窗不重叠
+        layout_slot = max(0, int(worker_id) - 1)
+        layout_total = max(1, int(worker_count or 1))
         try:
-            start_browser(log_callback=logf)
+            start_browser(
+                log_callback=logf,
+                layout_slot=layout_slot,
+                layout_total=layout_total,
+            )
             logf("[*] 浏览器已启动")
+            processed_any = False
             while not self.should_stop():
                 try:
                     idx = task_queue.get_nowait()
                 except queue.Empty:
                     break
+                if processed_any:
+                    # 回收后仍落到同一布局槽，避免又叠在一起
+                    TabPool.release_tab()
+                    start_browser(
+                        log_callback=logf,
+                        layout_slot=layout_slot,
+                        layout_total=layout_total,
+                    )
+                    sleep_with_cancel(1, self.should_stop)
+                processed_any = True
                 logf(f"--- 开始第 {idx}/{total} 个账号 ---")
                 try:
                     self._run_single_registration(idx, total, logf)
@@ -4024,8 +4784,6 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    restart_browser(log_callback=logf)
-                    sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             logf(f"[!] 线程异常: {exc}")
         finally:
@@ -4043,7 +4801,11 @@ class GrokRegisterGUI:
         if start_interval < 0:
             start_interval = 0.0
         for wid in range(1, worker_count + 1):
-            t = threading.Thread(target=self._worker_loop, args=(wid, count, task_queue), daemon=True)
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(wid, count, task_queue, worker_count),
+                daemon=True,
+            )
             workers.append(t)
             t.start()
             if wid < worker_count and start_interval > 0:

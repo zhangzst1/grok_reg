@@ -77,8 +77,8 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 
 - 运行时只读取并选择 `mail_credentials.txt` 中尚未使用的主邮箱，不创建临时邮箱，也不生成 plus alias
 - `email_provider` 默认使用 `hotmail` / `outlookmail`；YYDS 只有在 `allow_yyds_generation=true` 时才会创建临时邮箱，其他临时邮箱提供商仍会被禁用
-- `hotmail_code_mode=manual`（默认）：CLI 在终端提示输入验证码，GUI 弹出输入框；支持 `ABC-123` 或 `ABC123`
-- CLI 多线程会串行显示输入提示；GUI 多线程会逐个显示验证码窗口，提示中包含目标邮箱
+- `hotmail_code_mode=manual`（默认）：直接在当前注册浏览器的验证码页面输入；输入完整后程序会自动继续
+- 多线程注册时，请在各自的浏览器窗口中输入对应邮箱收到的验证码
 - `hotmail_code_mode=imap`：经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP 自动拉验证码
 - `hotmail_code_mode=api`：调用 `utils/verification_code.py` 中的外部 API 等待邮件并提取验证码；使用该文件内置的 API Key、超时重试和代理故障直连逻辑
 - `mail_retry_count=0`：邮箱阶段只尝试一次，并关闭 Hotmail API 内部的 HTTP 失败重试
@@ -366,7 +366,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 | 协议 verify/approve 失败 | 会话态变化 / 风控；看日志后自动回退浏览器 |
 | 一直 `authorization_pending` | 浏览器路径未完成 consent；需到「设备已授权」且 token 200 |
 | Cloudflare / Turnstile | 回退浏览器时关 headless、开 turnstilePatch、检查代理 |
-| Hotmail 手动模式未出现输入框 | 检查 `hotmail_code_mode=manual`；CLI 查看终端，GUI 查看验证码弹窗 |
+| Hotmail 手动模式无法输入 | 检查 `hotmail_code_mode=manual`，并在当前注册浏览器的验证码页面直接输入 |
 | Hotmail IMAP 收不到码 | 设置 `hotmail_code_mode=imap`，检查四段凭证、ClientID/Token、IMAP 主机与 alias 计数 |
 | Hotmail API 模式取码失败 | 设置 `hotmail_code_mode=api`，确认目标邮箱可被外部服务查询；查看“Hotmail API 获取验证码失败”后的原始错误 |
 | 有 token 但无 grok-4.5 | `cpa_base_url` 是否为 `cli-chat-proxy` |

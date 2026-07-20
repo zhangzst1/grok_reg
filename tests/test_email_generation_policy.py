@@ -73,6 +73,7 @@ class RuntimeEmailGenerationPolicyTests(unittest.TestCase):
                     reg.config.update(
                         {
                             "email_provider": provider,
+                            "allow_yyds_generation": False,
                             "cloudflare_api_base": "https://mail.invalid",
                             "defaultDomains": "example.com",
                         }
@@ -126,6 +127,7 @@ class RuntimeEmailGenerationPolicyTests(unittest.TestCase):
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=[account]),
             mock.patch.object(reg, "is_email_used", return_value=False),
+            mock.patch.object(reg, "get_rejected_email_domains", return_value=set()),
             mock.patch.object(
                 reg.secrets,
                 "choice",
@@ -150,6 +152,7 @@ class RuntimeEmailGenerationPolicyTests(unittest.TestCase):
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=[account]),
             mock.patch.object(reg, "is_email_used", return_value=True),
+            mock.patch.object(reg, "get_rejected_email_domains", return_value=set()),
             mock.patch.object(
                 reg.secrets,
                 "choice",

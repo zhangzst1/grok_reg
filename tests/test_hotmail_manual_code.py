@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import unittest
 import threading
-import time
-import queue
 import runpy
 from pathlib import Path
 from unittest import mock
@@ -36,6 +34,16 @@ class HotmailApiConfigurationTests(unittest.TestCase):
         source = Path(reg.__file__).read_text(encoding="utf-8")
         self.assertIn("max_mail_retry = get_mail_attempt_count()", source)
 
+    def test_cli_manual_mode_has_no_console_prompt(self) -> None:
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("manual_hotmail_code_input", source)
+        self.assertNotIn("input(", source)
+
+    def test_gui_manual_mode_has_no_tk_code_dialog(self) -> None:
+        source = Path(reg.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("simpledialog", source)
+        self.assertNotIn("request_manual_hotmail_code", source)
+
 
 class ManualVerificationCodeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -56,23 +64,12 @@ class ManualVerificationCodeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "验证码格式无效"):
                     reg.normalize_manual_verification_code(value)
 
-    def test_manual_mode_uses_callback_without_calling_imap(self) -> None:
+    def test_manual_mode_is_handled_by_browser_flow(self) -> None:
         reg.config.update({"email_provider": "hotmail", "hotmail_code_mode": "manual"})
-        callback = mock.Mock(return_value="abc-123")
         with mock.patch.object(reg, "hotmail_get_oai_code") as imap:
-            code = reg.get_oai_code(
-                "dev-token",
-                "user@hotmail.com",
-                manual_code_callback=callback,
-            )
-        self.assertEqual(code, "ABC-123")
-        callback.assert_called_once_with("user@hotmail.com")
+            with self.assertRaisesRegex(RuntimeError, "浏览器验证码页面"):
+                reg.get_oai_code("dev-token", "user@hotmail.com")
         imap.assert_not_called()
-
-    def test_manual_mode_requires_callback(self) -> None:
-        reg.config.update({"email_provider": "hotmail", "hotmail_code_mode": "manual"})
-        with self.assertRaisesRegex(RuntimeError, "缺少输入通道"):
-            reg.get_oai_code("dev-token", "user@hotmail.com")
 
     def test_imap_mode_keeps_existing_hotmail_flow(self) -> None:
         reg.config.update({"email_provider": "hotmail", "hotmail_code_mode": "imap"})
@@ -173,9 +170,12 @@ class ManualVerificationCodeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "可选值为 manual、imap 或 api"):
             reg.get_oai_code("dev-token", "user@hotmail.com")
 
-    def test_cancelled_manual_input_is_not_retryable(self) -> None:
+    def test_browser_manual_timeout_is_retryable_but_cancellation_is_not(self) -> None:
         self.assertTrue(reg.should_retry_verification_error("未收到验证码邮件"))
-        self.assertFalse(reg.should_retry_verification_error("手动验证码输入已取消"))
+        self.assertTrue(
+            reg.should_retry_verification_error("等待在浏览器输入 Hotmail 验证码超时")
+        )
+        self.assertFalse(reg.should_retry_verification_error("验证码输入已取消"))
 
 
 class HotmailMainMailboxSelectionTests(unittest.TestCase):
@@ -203,6 +203,7 @@ class HotmailMainMailboxSelectionTests(unittest.TestCase):
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=accounts),
             mock.patch.object(reg, "is_email_used", return_value=False),
+            mock.patch.object(reg, "get_rejected_email_domains", return_value=set()),
         ):
             first_email, _ = reg.hotmail_get_email_and_token()
             second_email, _ = reg.hotmail_get_email_and_token()
@@ -228,6 +229,7 @@ class HotmailMainMailboxSelectionTests(unittest.TestCase):
         with (
             mock.patch.object(reg, "_hotmail_load_accounts", return_value=accounts),
             mock.patch.object(reg, "is_email_used", return_value=False),
+            mock.patch.object(reg, "get_rejected_email_domains", return_value=set()),
         ):
             threads = [
                 threading.Thread(target=allocate)
@@ -271,137 +273,182 @@ class MailRetryConfigurationTests(unittest.TestCase):
                 self.assertEqual(reg.get_mail_attempt_count(), 3)
 
 
-class CliManualVerificationCodeTests(unittest.TestCase):
-    def test_cli_accepts_valid_code(self) -> None:
-        with mock.patch("builtins.input", return_value="abc-123"):
-            self.assertEqual(
-                cli.manual_hotmail_code_input("user@hotmail.com"),
-                "ABC-123",
+class BrowserManualVerificationCodeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_config = dict(reg.config)
+        reg.config.update(
+            {
+                "email_provider": "hotmail",
+                "hotmail_code_mode": "manual",
+                "mail_timeout": 30,
+            }
+        )
+
+    def tearDown(self) -> None:
+        reg.config.clear()
+        reg.config.update(self.original_config)
+
+    def test_wait_reads_code_entered_in_browser(self) -> None:
+        page = mock.Mock()
+        page.run_js.side_effect = ["waiting:", "code:abc123"]
+        log_callback = mock.Mock()
+        with mock.patch.object(reg, "human_sleep"):
+            code, already_submitted = reg.wait_for_manual_code_in_browser(
+                page,
+                "user@hotmail.com",
+                timeout=10,
+                log_callback=log_callback,
             )
 
-    def test_cli_reprompts_after_invalid_code(self) -> None:
-        with mock.patch("builtins.input", side_effect=["bad", "XYZ789"]) as prompt:
-            self.assertEqual(
-                cli.manual_hotmail_code_input("user@hotmail.com"),
-                "XYZ789",
+        self.assertEqual(code, "ABC123")
+        self.assertFalse(already_submitted)
+        log_callback.assert_called_once()
+
+    def test_wait_accepts_page_that_already_advanced(self) -> None:
+        page = mock.Mock()
+        page.run_js.return_value = "submitted:"
+        code, already_submitted = reg.wait_for_manual_code_in_browser(
+            page,
+            "user@hotmail.com",
+            timeout=10,
+        )
+        self.assertIsNone(code)
+        self.assertTrue(already_submitted)
+
+    def test_wait_prefers_profile_over_remembered_code(self) -> None:
+        """If profile form is already visible, treat code as browser-submitted."""
+        page = mock.Mock()
+        # Production JS now checks profile before returning a remembered code.
+        page.run_js.return_value = "submitted:"
+        code, already_submitted = reg.wait_for_manual_code_in_browser(
+            page,
+            "user@hotmail.com",
+            timeout=10,
+        )
+        self.assertIsNone(code)
+        self.assertTrue(already_submitted)
+
+    def test_wait_honors_cancellation(self) -> None:
+        page = mock.Mock()
+        with self.assertRaises(reg.RegistrationCancelled):
+            reg.wait_for_manual_code_in_browser(
+                page,
+                "user@hotmail.com",
+                timeout=10,
+                cancel_callback=lambda: True,
             )
-        self.assertEqual(prompt.call_count, 2)
+        page.run_js.assert_not_called()
 
-    def test_cli_blank_input_cancels(self) -> None:
-        with mock.patch("builtins.input", return_value=""):
-            with self.assertRaisesRegex(RuntimeError, "已取消"):
-                cli.manual_hotmail_code_input("user@hotmail.com")
-
-    def test_cli_serializes_concurrent_stdin_reads(self) -> None:
-        state_lock = threading.Lock()
-        active = 0
-        max_active = 0
-        results: list[str] = []
-
-        def fake_input(_prompt: str) -> str:
-            nonlocal active, max_active
-            with state_lock:
-                active += 1
-                max_active = max(max_active, active)
-            time.sleep(0.05)
-            with state_lock:
-                active -= 1
-            return "ABC123"
-
-        def worker(email: str) -> None:
-            results.append(cli.manual_hotmail_code_input(email))
-
-        with mock.patch("builtins.input", side_effect=fake_input):
-            threads = [
-                threading.Thread(target=worker, args=(f"user{i}@hotmail.com",))
-                for i in range(2)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=2)
-
-        self.assertEqual(results, ["ABC123", "ABC123"])
-        self.assertEqual(max_active, 1)
-
-
-class _FakeRoot:
-    def __init__(self) -> None:
-        self.scheduled = []
-
-    def after(self, _delay: int, callback) -> None:
-        self.scheduled.append(callback)
-
-
-class GuiManualVerificationCodeTests(unittest.TestCase):
-    def make_gui(self):
-        gui = reg.GrokRegisterGUI.__new__(reg.GrokRegisterGUI)
-        gui.root = _FakeRoot()
-        gui.manual_code_requests = queue.Queue()
-        gui._manual_code_dialog_active = False
-        gui.stop_requested = False
-        gui.is_running = True
-        return gui
-
-    def run_request(self, gui, email="user@hotmail.com"):
-        result = {}
-
-        def worker() -> None:
-            try:
-                result["code"] = gui.request_manual_hotmail_code(email)
-            except BaseException as exc:  # noqa: BLE001 - assert exact surfaced error
-                result["error"] = exc
-
-        thread = threading.Thread(target=worker)
-        thread.start()
-        deadline = time.time() + 1
-        while gui.manual_code_requests.empty() and time.time() < deadline:
-            time.sleep(0.01)
-        return result, thread
-
-    def test_gui_returns_code_from_main_thread_dialog(self) -> None:
-        gui = self.make_gui()
-        result, thread = self.run_request(gui)
-        dialog = mock.Mock()
-        dialog.askstring.return_value = "abc-123"
-        with mock.patch.object(reg, "simpledialog", dialog, create=True):
-            gui._process_manual_code_requests()
-        thread.join(timeout=1)
-        self.assertEqual(result.get("code"), "ABC-123")
-        self.assertNotIn("error", result)
-
-    def test_gui_reprompts_after_invalid_code(self) -> None:
-        gui = self.make_gui()
-        result, thread = self.run_request(gui)
-        dialog = mock.Mock()
-        dialog.askstring.side_effect = ["bad", "XYZ789"]
+    def test_wait_reports_timeout(self) -> None:
+        page = mock.Mock()
         with (
-            mock.patch.object(reg, "simpledialog", dialog, create=True),
-            mock.patch.object(reg.messagebox, "showerror") as showerror,
+            mock.patch.object(reg.time, "time", side_effect=[0, 2]),
+            self.assertRaisesRegex(RuntimeError, "浏览器输入.*超时"),
         ):
-            gui._process_manual_code_requests()
-        thread.join(timeout=1)
-        self.assertEqual(result.get("code"), "XYZ789")
-        self.assertEqual(dialog.askstring.call_count, 2)
-        showerror.assert_called_once()
+            reg.wait_for_manual_code_in_browser(
+                page,
+                "user@hotmail.com",
+                timeout=1,
+            )
+        page.run_js.assert_not_called()
 
-    def test_gui_dialog_cancel_surfaces_clear_error(self) -> None:
-        gui = self.make_gui()
-        result, thread = self.run_request(gui)
-        dialog = mock.Mock()
-        dialog.askstring.return_value = None
-        with mock.patch.object(reg, "simpledialog", dialog, create=True):
-            gui._process_manual_code_requests()
-        thread.join(timeout=1)
-        self.assertIsInstance(result.get("error"), RuntimeError)
-        self.assertIn("已取消", str(result["error"]))
+    def test_fill_manual_mode_skips_mail_fetch_and_submits_browser_code(self) -> None:
+        page = mock.Mock()
+        page.run_js.side_effect = ["filled-aggregate", "clicked"]
+        with (
+            mock.patch.object(reg, "_get_page", return_value=page),
+            mock.patch.object(reg, "check_timeout"),
+            mock.patch.object(reg, "dump_state"),
+            mock.patch.object(reg, "take_screenshot"),
+            mock.patch.object(reg, "human_sleep"),
+            mock.patch.object(
+                reg,
+                "wait_for_manual_code_in_browser",
+                return_value=("ABC123", False),
+            ) as browser_wait,
+            mock.patch.object(reg, "get_oai_code") as mail_fetch,
+        ):
+            code = reg.fill_code_and_submit("user@hotmail.com", "dev-token")
 
-    def test_gui_stop_cancels_waiting_request(self) -> None:
-        gui = self.make_gui()
-        result, thread = self.run_request(gui)
-        gui.stop_requested = True
-        thread.join(timeout=1)
-        self.assertIsInstance(result.get("error"), reg.RegistrationCancelled)
+        self.assertEqual(code, "ABC123")
+        browser_wait.assert_called_once()
+        mail_fetch.assert_not_called()
+
+    def test_fill_manual_mode_accepts_browser_auto_submit(self) -> None:
+        page = mock.Mock()
+        with (
+            mock.patch.object(reg, "_get_page", return_value=page),
+            mock.patch.object(reg, "check_timeout"),
+            mock.patch.object(reg, "dump_state"),
+            mock.patch.object(reg, "take_screenshot"),
+            mock.patch.object(
+                reg,
+                "wait_for_manual_code_in_browser",
+                return_value=(None, True),
+            ),
+            mock.patch.object(reg, "get_oai_code") as mail_fetch,
+        ):
+            code = reg.fill_code_and_submit("user@hotmail.com", "dev-token")
+
+        self.assertEqual(code, "已在浏览器提交")
+        mail_fetch.assert_not_called()
+        page.run_js.assert_not_called()
+
+    def test_fill_manual_mode_skips_re_fill_when_profile_already_visible(self) -> None:
+        """Race: code captured while OTP still present, then page advanced."""
+        page = mock.Mock()
+        page.run_js.return_value = "not-ready"
+        log_callback = mock.Mock()
+        with (
+            mock.patch.object(reg, "_get_page", return_value=page),
+            mock.patch.object(reg, "check_timeout"),
+            mock.patch.object(reg, "dump_state"),
+            mock.patch.object(reg, "take_screenshot"),
+            mock.patch.object(reg, "human_sleep"),
+            mock.patch.object(
+                reg,
+                "wait_for_manual_code_in_browser",
+                return_value=("ABC123", False),
+            ),
+            mock.patch.object(
+                reg,
+                "_page_has_visible_profile_form",
+                return_value=True,
+            ) as profile_check,
+            mock.patch.object(reg, "get_oai_code") as mail_fetch,
+        ):
+            code = reg.fill_code_and_submit(
+                "user@hotmail.com",
+                "dev-token",
+                log_callback=log_callback,
+            )
+
+        self.assertEqual(code, "已在浏览器提交")
+        profile_check.assert_called()
+        mail_fetch.assert_not_called()
+        log_callback.assert_any_call("[*] 验证码已在浏览器中输入并提交")
+
+    def test_fill_non_manual_mode_does_not_short_circuit_on_profile(self) -> None:
+        """imap/api re-fill path must not treat profile form as success."""
+        reg.config["hotmail_code_mode"] = "imap"
+        page = mock.Mock()
+        page.run_js.side_effect = ["not-ready", "filled-aggregate", "clicked"]
+        with (
+            mock.patch.object(reg, "_get_page", return_value=page),
+            mock.patch.object(reg, "check_timeout"),
+            mock.patch.object(reg, "dump_state"),
+            mock.patch.object(reg, "take_screenshot"),
+            mock.patch.object(reg, "human_sleep"),
+            mock.patch.object(reg, "get_oai_code", return_value="ABC123"),
+            mock.patch.object(
+                reg,
+                "_page_has_visible_profile_form",
+            ) as profile_check,
+        ):
+            code = reg.fill_code_and_submit("user@hotmail.com", "dev-token")
+
+        self.assertEqual(code, "ABC123")
+        profile_check.assert_not_called()
 
 
 if __name__ == "__main__":

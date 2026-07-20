@@ -100,30 +100,6 @@ def log(worker_id: int | str, msg: str) -> None:
     _log_queue.put(f"[{time.strftime('%H:%M:%S')}] [W{worker_id}] {msg}")
 
 
-# ── Hotmail 手动验证码 ──
-
-_manual_code_input_lock = threading.Lock()
-
-
-def manual_hotmail_code_input(email: str) -> str:
-    """Read one Hotmail verification code without concurrent stdin prompts."""
-    with _manual_code_input_lock:
-        while True:
-            try:
-                raw = input(
-                    f"\n[Hotmail] 请输入 {email} 收到的验证码 "
-                    "(ABC-123 或 ABC123，直接回车取消): "
-                )
-            except (EOFError, KeyboardInterrupt) as exc:
-                raise RuntimeError("手动验证码输入已取消") from exc
-            if not str(raw or "").strip():
-                raise RuntimeError("手动验证码输入已取消")
-            try:
-                return reg.normalize_manual_verification_code(raw)
-            except ValueError as exc:
-                print(f"[Hotmail] {exc}，请重新输入。", flush=True)
-
-
 # ── 统计 ──
 
 _stats_lock = threading.Lock()
@@ -300,15 +276,22 @@ def register_one(
                 dev_token,
                 log_callback=lambda m: log(worker_id, m),
                 cancel_callback=cancel,
-                manual_code_callback=manual_hotmail_code_input,
             )
             log(worker_id, f"验证码: {code}")
             break
         except Exception as exc:
             msg = str(exc)
-            if reg.should_retry_verification_error(msg) and mail_try < max_mail_retry:
-                log(worker_id, f"! 本邮箱未取到验证码，换邮箱重试: {msg}")
-                _mark_email_stage_error(email, msg)
+            failed_email = str(getattr(exc, "email", "") or email or "").strip()
+            if failed_email:
+                email = failed_email
+            already_persisted = bool(getattr(exc, "persisted", False))
+            if reg.should_retry_email_error(msg) and mail_try < max_mail_retry:
+                if reg.is_email_rejected_error(msg):
+                    log(worker_id, f"! 邮箱域名已被拒绝，换其他域名邮箱重试: {msg}")
+                else:
+                    log(worker_id, f"! 本邮箱未取到验证码，换邮箱重试: {msg}")
+                if not already_persisted:
+                    _mark_email_stage_error(email, msg)
                 try:
                     reg.restart_browser(log_callback=lambda m: log(worker_id, m))
                 except Exception:
@@ -316,11 +299,12 @@ def register_one(
                 reg.sleep_with_cancel(1, cancel)
                 continue
             log(worker_id, f"! 邮箱阶段失败: 邮箱={email or '未分配'} 原因={msg}")
-            _mark_email_stage_error(email, msg)
+            if not already_persisted:
+                _mark_email_stage_error(email, msg)
             traceback.print_exc()
             _inc("reg_fail")
             try:
-                reg.restart_browser(log_callback=lambda m: log(worker_id, m))
+                reg.stop_browser()
             except Exception:
                 pass
             return None
@@ -405,7 +389,7 @@ def register_one(
         traceback.print_exc()
         _inc("reg_fail")
         try:
-            reg.restart_browser(log_callback=lambda m: log(worker_id, m))
+            reg.stop_browser()
         except Exception:
             pass
         return None

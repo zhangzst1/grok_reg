@@ -350,6 +350,7 @@ class CliRegistrationFailureTests(unittest.TestCase):
         with (
             mock.patch.object(cli, "_ensure_browser"),
             mock.patch.object(cli.reg, "get_mail_attempt_count", return_value=1),
+            mock.patch.object(cli.reg, "get_email_provider", return_value="hotmail"),
             mock.patch.object(cli.reg, "open_signup_page"),
             mock.patch.object(
                 cli.reg,
@@ -362,7 +363,8 @@ class CliRegistrationFailureTests(unittest.TestCase):
                 side_effect=RuntimeError("验证码阶段失败"),
             ),
             mock.patch.object(cli.reg, "should_retry_verification_error", return_value=False),
-            mock.patch.object(cli.reg, "restart_browser"),
+            mock.patch.object(cli.reg, "restart_browser") as restart_browser,
+            mock.patch.object(cli.reg, "stop_browser") as stop_browser,
             mock.patch.object(cli.reg, "mark_error") as mark_error,
             mock.patch.object(cli.traceback, "print_exc"),
             mock.patch.object(cli, "log") as log,
@@ -370,6 +372,8 @@ class CliRegistrationFailureTests(unittest.TestCase):
             result = cli.register_one(2, 61, 61, "accounts_cli.txt")
 
         self.assertIsNone(result)
+        restart_browser.assert_not_called()
+        stop_browser.assert_called_once_with()
         mark_error.assert_called_once_with(failed_email, reason="验证码阶段失败")
         messages = [call.args[1] for call in log.call_args_list if len(call.args) > 1]
         self.assertTrue(
